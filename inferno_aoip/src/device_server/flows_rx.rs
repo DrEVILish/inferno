@@ -132,6 +132,10 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
             let audio_bytes = &buf[9..recv_size];
 
             let stride = num_channels * sd.bytes_per_sample;
+            if stride == 0 || !(2..=4).contains(&sd.bytes_per_sample) {
+              // add_socket refuses such flows; never divide by zero or panic in this thread
+              return Command::NoOp;
+            }
             let samples_count = audio_bytes.len() / stride;
             //info!("first byte = {}, assuming {} samples in {} channels", buf[0], samples_count, num_channels);
             for (i, ch) in sd.channels.iter_mut().enumerate() {
@@ -148,9 +152,7 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
                     2 => sink.write_from_at(ts as usize, S16ReaderIterator(reader)),
                     3 => sink.write_from_at(ts as usize, S24ReaderIterator(reader)),
                     4 => sink.write_from_at(ts as usize, S32ReaderIterator(reader)),
-                    other => {
-                      panic!("unsupported bytes per sample {}", other);
-                    }
+                    _ => unreachable!("bytes per sample checked above"),
                   };
                 });
               }
@@ -539,6 +541,14 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
   ) {
     // TODO: it would be more logical to move socket creation here from channels_subscriber.rs which is already convoluted
     debug!("adding flow receiver local index={local_index}");
+    // the format comes from the transmitter's advertisement: refuse what the
+    // receive thread cannot parse instead of letting it panic there
+    if local_index >= MAX_FLOWS || !(2..=4).contains(&bytes_per_sample) || channels_count == 0 {
+      error!(
+        "refusing flow receiver index={local_index}: {bytes_per_sample} bytes per sample, {channels_count} channels"
+      );
+      return;
+    }
     let empty_sinks_vecs = (0..channels_count)
       .map(|_| {
         let mut v = vec![];
@@ -591,8 +601,20 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
 
     {
       let mut flows_info = self.flows_info.write().unwrap();
-      flows_info[local_flow_index].as_mut().unwrap().channels_map[channel_in_flow]
-        .set(local_channel_index, true);
+      let slot = flows_info
+        .get_mut(local_flow_index)
+        .and_then(Option::as_mut)
+        .and_then(|flow| flow.channels_map.get_mut(channel_in_flow))
+        .filter(|_| local_channel_index < self.max_channels);
+      match slot {
+        Some(map) => {
+          map.set(local_channel_index, true);
+        }
+        None => {
+          error!("connect_channel: no channel {channel_in_flow} in flow index {local_flow_index} (local channel {local_channel_index})");
+          return;
+        }
+      }
     }
 
     self
@@ -613,8 +635,20 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
 
     {
       let mut flows_info = self.flows_info.write().unwrap();
-      flows_info[local_flow_index].as_mut().unwrap().channels_map[channel_in_flow]
-        .set(local_channel_index, false);
+      let slot = flows_info
+        .get_mut(local_flow_index)
+        .and_then(Option::as_mut)
+        .and_then(|flow| flow.channels_map.get_mut(channel_in_flow))
+        .filter(|_| local_channel_index < self.max_channels);
+      match slot {
+        Some(map) => {
+          map.set(local_channel_index, false);
+        }
+        None => {
+          error!("disconnect_channel: no channel {channel_in_flow} in flow index {local_flow_index} (local channel {local_channel_index})");
+          return;
+        }
+      }
     }
 
     self
