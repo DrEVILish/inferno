@@ -24,6 +24,43 @@ use tokio::sync::{broadcast as broadcast_queue, mpsc, watch, Mutex};
 use crate::common::*;
 use crate::device_info::DeviceInfo;
 
+/// Runs a request server and starts it again (after a growing pause) if it
+/// panics. The servers parse packets from any host on the network; their
+/// parsers are bounds-checked, and this keeps one unforeseen panic from taking
+/// the service down until the process restarts. A panicked task drops its
+/// socket while unwinding, so the restarted one can bind the same port.
+async fn supervise<F, Fut>(name: &'static str, mut shutdown: broadcast_queue::Receiver<()>, start: F)
+where
+  F: Fn(broadcast_queue::Receiver<()>) -> Fut,
+  Fut: Future<Output = ()> + Send + 'static,
+{
+  const FIRST_PAUSE: Duration = Duration::from_millis(100);
+  const MAX_PAUSE: Duration = Duration::from_secs(5);
+  const HEALTHY_RUN: Duration = Duration::from_secs(60);
+  let mut pause = FIRST_PAUSE;
+  loop {
+    let started = Instant::now();
+    match tokio::spawn(start(shutdown.resubscribe())).await {
+      Ok(()) => return, // normal exit: shutdown
+      Err(e) if e.is_panic() => {
+        if started.elapsed() > HEALTHY_RUN {
+          pause = FIRST_PAUSE;
+        }
+        error!("{name} panicked, restarting it in {pause:?}");
+        tokio::select! {
+          _ = shutdown.recv() => return,
+          _ = tokio::time::sleep(pause) => {}
+        }
+        pause = (pause * 2).min(MAX_PAUSE);
+      }
+      Err(e) => {
+        error!("{name} task ended unexpectedly: {e}");
+        return;
+      }
+    }
+  }
+}
+
 pub(crate) mod arc_server;
 pub(crate) mod cmc_server;
 pub(crate) mod flows_control_server;
@@ -121,17 +158,35 @@ impl DeviceServer {
     let flows_tx: Arc<Mutex<Option<FlowsTransmitter>>> = Default::default();
     let tx_multicasts: Arc<Mutex<Option<TransmitMulticasts>>> = Default::default();
     tasks.append(&mut vec![
-      tokio::spawn(arc_server::run_server(
-        self_info.clone(),
-        state_storage.clone(),
-        mdns_handle.clone(),
-        mcast_tx.clone(),
-        channels_sub_rx.clone(),
-        flows_tx.clone(),
-        tx_multicasts.clone(),
-        shdn_recv1,
-      )),
-      tokio::spawn(cmc_server::run_server(self_info.clone(), shdn_recv2)),
+      tokio::spawn({
+        let (self_info, state_storage, mdns_handle, mcast_tx, channels_sub_rx, flows_tx, tx_multicasts) = (
+          self_info.clone(),
+          state_storage.clone(),
+          mdns_handle.clone(),
+          mcast_tx.clone(),
+          channels_sub_rx.clone(),
+          flows_tx.clone(),
+          tx_multicasts.clone(),
+        );
+        supervise("ARC server", shdn_recv1, move |shutdown| {
+          arc_server::run_server(
+            self_info.clone(),
+            state_storage.clone(),
+            mdns_handle.clone(),
+            mcast_tx.clone(),
+            channels_sub_rx.clone(),
+            flows_tx.clone(),
+            tx_multicasts.clone(),
+            shutdown,
+          )
+        })
+      }),
+      tokio::spawn({
+        let self_info = self_info.clone();
+        supervise("CMC server", shdn_recv2, move |shutdown| {
+          cmc_server::run_server(self_info.clone(), shutdown)
+        })
+      }),
       tokio::spawn(info_mcast_server::run_server(
         self_info.clone(),
         mcast_rx,
@@ -326,11 +381,12 @@ impl DeviceServer {
       self.mdns_server.add_tx_channel(index);
     }
     let (shutdown_send, shutdown_recv) = broadcast_queue::channel(16);
-    let flows_control_task = tokio::spawn(flows_control_server::run_server(
-      self.self_info.clone(),
-      self.flows_tx.clone(),
-      shutdown_recv,
-    ));
+    let flows_control_task = tokio::spawn({
+      let (self_info, flows_tx) = (self.self_info.clone(), self.flows_tx.clone());
+      supervise("flow control server", shutdown_recv, move |shutdown| {
+        flows_control_server::run_server(self_info.clone(), flows_tx.clone(), shutdown)
+      })
+    });
     //let peaks_work = Arc::new(AtomicBool::new(true));
     //let peaks_work1 = peaks_work.clone();
     //let peaks = self.tx_peaks.clone();
@@ -409,5 +465,49 @@ impl DeviceServer {
     self.shutdown_todo.await;
     self.clock_receiver.stop().await.unwrap();
     info!("shutdown ok");
+  }
+}
+
+#[cfg(test)]
+mod supervise_tests {
+  use super::*;
+  use std::sync::atomic::{AtomicUsize, Ordering};
+
+  #[tokio::test]
+  async fn restarts_a_panicking_server_and_stops_on_shutdown() {
+    let (shutdown_send, shutdown_recv) = broadcast_queue::channel(4);
+    let starts = Arc::new(AtomicUsize::new(0));
+    let s = starts.clone();
+    let supervisor = tokio::spawn(supervise("test server", shutdown_recv, move |mut shutdown| {
+      let n = s.fetch_add(1, Ordering::SeqCst);
+      async move {
+        if n < 2 {
+          panic!("simulated malformed packet");
+        }
+        let _ = shutdown.recv().await;
+      }
+    }));
+    // two panics: pauses of 100 ms and 200 ms before the third start
+    for _ in 0..100 {
+      if starts.load(Ordering::SeqCst) >= 3 {
+        break;
+      }
+      tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(starts.load(Ordering::SeqCst), 3);
+    shutdown_send.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), supervisor).await.unwrap().unwrap();
+    assert_eq!(starts.load(Ordering::SeqCst), 3, "not restarted after a normal exit");
+  }
+
+  #[tokio::test]
+  async fn shutdown_during_restart_pause_stops_it() {
+    let (shutdown_send, shutdown_recv) = broadcast_queue::channel(4);
+    let supervisor = tokio::spawn(supervise("test server", shutdown_recv, |_shutdown| async {
+      panic!("always");
+    }));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    shutdown_send.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), supervisor).await.unwrap().unwrap();
   }
 }
