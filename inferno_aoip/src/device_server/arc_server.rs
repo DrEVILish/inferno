@@ -1,12 +1,14 @@
 use super::channels_subscriber::ChannelsSubscriber;
-use super::saved_settings::SavedChannelsSettings;
+use super::saved_settings::{is_valid_channel_name, SavedChannelsSettings};
 use super::tx_multicasts::TransmitMulticasts;
 use crate::mdns_client::MdnsClient;
 use crate::{byte_utils::*, net_utils};
 
 use super::flows_rx::MAX_FLOWS as MAX_RX_FLOWS;
+use super::flows_tx::{
+  validate_flow_layout, FlowsTransmitter, MAX_CHANNELS_IN_FLOW, MAX_FLOWS as MAX_TX_FLOWS,
+};
 use super::flows_tx::{FlowInfo as TXFlowInfo, FPP_MAX_ADVERTISED};
-use super::flows_tx::{FlowsTransmitter, MAX_CHANNELS_IN_FLOW, MAX_FLOWS as MAX_TX_FLOWS};
 use super::mdns_server::DeviceMDNSResponder;
 use crate::device_info::DeviceInfo;
 use crate::net_utils::UdpSocketWrapper;
@@ -236,6 +238,10 @@ pub async fn run_server(
               return None;
             }
             match read_0term_str_from_buffer(content, name_offset) {
+              Ok(new_name) if !is_valid_channel_name(new_name) => {
+                error!("refusing to rename TX channel id {channel_id} to invalid name {new_name:?}");
+                None
+              }
               Ok(new_name) => {
                 let index = (channel_id - 1) as usize;
                 if index < self_info.tx_channels.len() {
@@ -278,6 +284,10 @@ pub async fn run_server(
               return None;
             }
             match read_0term_str_from_buffer(content, name_offset) {
+              Ok(new_name) if !is_valid_channel_name(new_name) => {
+                error!("refusing to rename RX channel id {channel_id} to invalid name {new_name:?}");
+                None
+              }
               Ok(new_name) => {
                 let index = (channel_id - 1) as usize;
                 if index < self_info.rx_channels.len() {
@@ -398,69 +408,62 @@ pub async fn run_server(
           let content = request.content();
           let mut flow_ids = vec![];
           for descr_offset in deserialize_items::<u16>(content) {
-            let descr_offset: usize = descr_offset.into();
-            if descr_offset - HEADER_LENGTH
-              + create_multicast_tx_flow::FlowDescriptorHeader::SERIALIZED_SIZE
-              > content.len()
-            {
-              continue;
-            }
-            if let Ok(descr) = create_multicast_tx_flow::FlowDescriptorHeader::binary_deserialize(
-              &content[descr_offset - HEADER_LENGTH..]
-                [..create_multicast_tx_flow::FlowDescriptorHeader::SERIALIZED_SIZE],
-              binary_serde::Endianness::Big,
-            ) {
-              if descr.flow_type != 2 {
-                error!("wanted to create unknown flow type {}", descr.flow_type);
-                continue;
-              }
-              if descr.flow_id == 0 || descr.flow_id as usize > MAX_TX_FLOWS as _ {
-                // MAYBE TODO move this check to tx_multicasts
-                error!("wanted to create multicast tx flow with invalid flow id: {}", descr.flow_id);
-                continue;
-              }
-              let flow_index = (descr.flow_id as usize) - 1;
-              {
-                let mut flows_tx_opt = flows_tx.lock().await;
-                let flows_tx = if let Some(flows_tx) = flows_tx_opt.as_mut() {
-                  flows_tx
-                } else {
-                  error!("trying to create multicast tx flow but we have no flows transmitter active");
-                  continue;
-                };
-                if flows_tx.get_flows_info()[flow_index].is_some() {
-                  // TODO move this check to tx_multicasts or flows_tx
-                  error!("tx flow id busy: {}", descr.flow_id);
+            let (descr, channel_ids) =
+              match create_multicast_tx_flow::parse_descriptor(content, descr_offset.into()) {
+                Some(v) => v,
+                None => {
+                  error!("failed to parse multicast tx flow descriptor at offset {descr_offset}");
                   continue;
                 }
-              }
-              let after_header = &content[descr_offset - HEADER_LENGTH
-                + create_multicast_tx_flow::FlowDescriptorHeader::SERIALIZED_SIZE..];
-              if after_header.len()
-                < (descr.channels_count as usize)
-                  + create_multicast_tx_flow::FlowDescriptorFooter::SERIALIZED_SIZE
-              {
-                error!("multicast tx flow descriptor parse failed, too short channels list or footer");
-                continue;
-              }
-              let channels_bytes = &after_header[..(descr.channels_count as usize) * 2];
-              let channel_indices = channels_bytes
-                .chunks_exact(2)
-                .map(|chunk| u16::from_be_bytes(chunk.try_into().unwrap()))
-                .map(|id| if id > 0 { Some((id - 1).try_into().unwrap()) } else { None })
-                .collect_vec();
-
-              if let Some(txm) = tx_multicasts.lock().await.as_ref() {
-                txm.add_flow(flow_index, channel_indices).await;
-              } else {
-                error!("tx_multicasts None but got add multicast request");
-                continue;
-              }
-              flow_ids.push(flow_index + 1);
-            } else {
-              error!("failed to parse multicast tx flow descriptor");
+              };
+            if descr.flow_type != 2 {
+              error!("wanted to create unknown flow type {}", descr.flow_type);
               continue;
             }
+            if descr.flow_id == 0 || descr.flow_id as usize > MAX_TX_FLOWS as _ {
+              // MAYBE TODO move this check to tx_multicasts
+              error!("wanted to create multicast tx flow with invalid flow id: {}", descr.flow_id);
+              continue;
+            }
+            let flow_index = (descr.flow_id as usize) - 1;
+            let channel_indices = channel_ids
+              .iter()
+              .map(|&id| if id > 0 { Some((id - 1) as usize) } else { None })
+              .collect_vec();
+            if let Err(e) = validate_flow_layout(
+              &channel_indices,
+              FPP_MAX_ADVERTISED.into(),
+              (self_info.bits_per_sample / 8).into(),
+              self_info.tx_channels.len(),
+            ) {
+              error!("refusing multicast tx flow id {}: {e}", descr.flow_id);
+              continue;
+            }
+            {
+              let mut flows_tx_opt = flows_tx.lock().await;
+              let flows_tx = if let Some(flows_tx) = flows_tx_opt.as_mut() {
+                flows_tx
+              } else {
+                error!("trying to create multicast tx flow but we have no flows transmitter active");
+                continue;
+              };
+              if flows_tx.get_flows_info()[flow_index].is_some() {
+                // TODO move this check to tx_multicasts or flows_tx
+                error!("tx flow id busy: {}", descr.flow_id);
+                continue;
+              }
+            }
+
+            if let Some(txm) = tx_multicasts.lock().await.as_ref() {
+              if let Err(e) = txm.add_flow(flow_index, channel_indices).await {
+                error!("adding multicast tx flow id {} failed: {e:?}", descr.flow_id);
+                continue;
+              }
+            } else {
+              error!("tx_multicasts None but got add multicast request");
+              continue;
+            }
+            flow_ids.push(flow_index + 1);
           }
           if flow_ids.len() > 0 {
             let mut response = ByteBuffer::new();
@@ -476,12 +479,18 @@ pub async fn run_server(
         }
         delete_multicast_tx_flow::OPCODE => {
           let content = request.content();
-          let count = make_u16(content[0], content[1]).try_into().unwrap();
-          let flow_indices = content[4..]
-            .chunks_exact(2)
-            .map(|chunk| u16::from_be_bytes(chunk.try_into().unwrap()))
-            .take(count)
-            .filter_map(|id| if id > 0 { Some((id as usize) - 1) } else { None });
+          let flow_ids = match delete_multicast_tx_flow::parse_flow_ids(content) {
+            Some(ids) => ids,
+            None => {
+              error!("delete multicast tx flow: packet too short: {}", hex::encode(content));
+              conn.respond_with_code(0xFFFF /* TODO */, &[]).await;
+              continue;
+            }
+          };
+          let flow_indices = flow_ids
+            .into_iter()
+            .filter_map(|id| if id > 0 { Some((id as usize) - 1) } else { None })
+            .filter(|&index| index < MAX_TX_FLOWS as usize);
 
           let mut deleted_any = false;
 
@@ -704,16 +713,29 @@ pub async fn run_server(
           }
         }
 
-        0x3014 => {
+        remove_rx_subscriptions::OPCODE => {
           // netaudio subscription remove (used by network-audio-controller)
           // received unknown opcode1 0x3014, content 000100000002
           // whole packet: "27ff00104a1c30140000000100000002"
           if let Some(channels_recv) = &subscriber {
             let content = request.content();
-            let local_channel = make_u16(content[4], content[5]);
-            let local_channel_index = (local_channel - 1) as usize;
+            let local_channel = match remove_rx_subscriptions::parse_channel_ids(content)
+              .and_then(|ids| ids.first().copied())
+            {
+              Some(id) => id,
+              None => {
+                error!("0x3014: no channel in request: {}", hex::encode(content));
+                conn.respond_with_code(0xFFFF /* TODO */, &[]).await;
+                continue;
+              }
+            };
+            if local_channel == 0 || local_channel as usize > self_info.rx_channels.len() {
+              error!("0x3014: disconnect requested for nonexisting channel {local_channel}");
+              conn.respond_with_code(0xFFFF /* TODO */, &[]).await;
+              continue;
+            }
             info!("disconnect requested: local channel {}", local_channel);
-            channels_recv.unsubscribe(local_channel_index).await;
+            channels_recv.unsubscribe((local_channel - 1) as usize).await;
             conn.respond(&[]).await;
           }
         }

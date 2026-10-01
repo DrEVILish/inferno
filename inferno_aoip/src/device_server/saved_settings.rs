@@ -9,6 +9,19 @@ use crate::{
   utils::LogAndForget,
 };
 
+/// Longest channel label accepted, as in Dante (31 characters).
+pub const MAX_CHANNEL_NAME_BYTES: usize = 31;
+
+/// Whether a channel label (from a rename request or saved state) is usable: it
+/// becomes part of an mDNS label `<name>@<hostname>` (at most 63 bytes, a longer
+/// one used to panic the mDNS responder) and of `<name>@<hostname>` subscription
+/// addresses, so it must be 1..=31 bytes without `.`, `=`, `@` or control characters.
+pub fn is_valid_channel_name(name: &str) -> bool {
+  !name.is_empty()
+    && name.len() <= MAX_CHANNEL_NAME_BYTES
+    && !name.chars().any(|c| c.is_control() || matches!(c, '.' | '=' | '@'))
+}
+
 #[derive(Deserialize, Serialize, Default)]
 pub struct ChannelSettings {
   id: usize,
@@ -48,6 +61,10 @@ impl SavedChannelsSettings {
         error!("corrupted saved channels: id {}", cs.id);
         continue;
       }
+      if !is_valid_channel_name(&cs.friendly_name) {
+        error!("ignoring invalid saved name for channel id {}: {:?}", cs.id, cs.friendly_name);
+        continue;
+      }
       *dst[index].friendly_name.write().unwrap() = cs.friendly_name.clone();
     }
     if dst.len() > src.len() {
@@ -71,5 +88,20 @@ impl SavedChannelsSettings {
   pub fn rename_tx_channel(&mut self, index: usize, name: String) {
     Self::rename(&mut self.tx_channels.channels, &self.self_info.tx_channels, index, name);
     self.state_storage.save("tx_channels", &self.tx_channels).log_and_forget();
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn channel_names() {
+    for ok in ["TX 1", "Kick In", "01", "a", &"x".repeat(31), "Gesang Ä"] {
+      assert!(is_valid_channel_name(ok), "{ok:?}");
+    }
+    for bad in ["", &"x".repeat(32), "a.b", "a=b", "a@b", "tab\there", "nl\n", &"Ä".repeat(16)] {
+      assert!(!is_valid_channel_name(bad), "{bad:?}");
+    }
   }
 }

@@ -228,10 +228,66 @@ pub mod create_multicast_tx_flow {
     pub unknown3_1: u16,
     pub unknown4_0: u16,
   }
+
+  /// Parses the flow descriptor at `descr_offset` (relative to the packet start, as
+  /// listed in the request) out of the request content: the header and its channel
+  /// ids (0 = empty slot). None if any part lies outside the content.
+  pub fn parse_descriptor(
+    content: &[u8],
+    descr_offset: usize,
+  ) -> Option<(FlowDescriptorHeader, Vec<u16>)> {
+    use binary_serde::BinarySerde;
+    let start = descr_offset.checked_sub(super::HEADER_LENGTH)?;
+    let header_end = start.checked_add(FlowDescriptorHeader::SERIALIZED_SIZE)?;
+    let header = FlowDescriptorHeader::binary_deserialize(
+      content.get(start..header_end)?,
+      binary_serde::Endianness::Big,
+    )
+    .ok()?;
+    let after_header = &content[header_end..];
+    let channels_len = header.channels_count as usize * 2;
+    if after_header.len() < channels_len + FlowDescriptorFooter::SERIALIZED_SIZE {
+      return None;
+    }
+    let ids =
+      after_header[..channels_len].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+    Some((header, ids))
+  }
 }
 
 pub mod delete_multicast_tx_flow {
   pub const OPCODE: u16 = 0x2202;
+
+  /// Flow ids to delete: `u16 count, u16 ?, count x u16 flow id`. None if the content
+  /// is shorter than its 4-byte header; a count larger than the ids present is clamped.
+  pub fn parse_flow_ids(content: &[u8]) -> Option<Vec<u16>> {
+    if content.len() < 4 {
+      return None;
+    }
+    let count = u16::from_be_bytes([content[0], content[1]]) as usize;
+    Some(content[4..].chunks_exact(2).take(count).map(|c| u16::from_be_bytes([c[0], c[1]])).collect())
+  }
+}
+
+/// Remove subscriptions (used by network-audio-controller's `subscription remove`).
+pub mod remove_rx_subscriptions {
+  pub const OPCODE: u16 = 0x3014;
+
+  /// Receive channel ids: `u16 count, count x u32 channel id`. None if the content is
+  /// shorter than its header; a count larger than the ids present is clamped.
+  pub fn parse_channel_ids(content: &[u8]) -> Option<Vec<u32>> {
+    if content.len() < 2 {
+      return None;
+    }
+    let count = u16::from_be_bytes([content[0], content[1]]) as usize;
+    Some(
+      content[2..]
+        .chunks_exact(4)
+        .take(count)
+        .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+        .collect(),
+    )
+  }
 }
 
 pub mod query_rx_flows {
@@ -645,6 +701,60 @@ mod tests {
   fn deserialize_items_empty() {
     let items: Vec<get_receive_channels::ChannelDescriptor> = deserialize_items(&[0, 0]).collect();
     assert!(items.is_empty());
+  }
+
+  #[test]
+  fn remove_rx_subscriptions_parse() {
+    use remove_rx_subscriptions::parse_channel_ids;
+    // netaudio, two channels: u16 count, then u32 ids
+    assert_eq!(parse_channel_ids(&[0, 2, 0, 0, 0, 1, 0, 0, 0, 2]), Some(vec![1, 2]));
+    // the single-channel example from the original handler's comment
+    assert_eq!(parse_channel_ids(&[0, 1, 0, 0, 0, 2]), Some(vec![2]));
+    assert_eq!(parse_channel_ids(&[]), None);
+    assert_eq!(parse_channel_ids(&[0]), None);
+    // count larger than the ids present (the old handler read content[4..6] unchecked)
+    assert_eq!(parse_channel_ids(&[0xff, 0xff, 0, 0]), Some(vec![]));
+    assert_eq!(parse_channel_ids(&[0, 3, 0, 0, 0, 7, 0]), Some(vec![7]));
+  }
+
+  #[test]
+  fn delete_multicast_tx_flow_parse() {
+    use delete_multicast_tx_flow::parse_flow_ids;
+    assert_eq!(parse_flow_ids(&[0, 2, 0, 0, 0, 1, 0, 5]), Some(vec![1, 5]));
+    for len in 0..4 {
+      assert_eq!(parse_flow_ids(&[0, 2, 0, 0][..len]), None, "len {len}");
+    }
+    assert_eq!(parse_flow_ids(&[0xff, 0xff, 0, 0, 0, 9, 1]), Some(vec![9]));
+  }
+
+  #[test]
+  fn create_multicast_tx_flow_parse() {
+    use create_multicast_tx_flow::*;
+    // content: u16 ?, u16 count=1, u16 descriptor offset (packet-relative), then the descriptor
+    let mut content = vec![0u8, 1, 0, (HEADER_LENGTH + 6) as u8];
+    content.extend_from_slice(&[0, 0]);
+    let header =
+      FlowDescriptorHeader { flow_id: 3, flow_type: 2, unknown1_0: [0; 10], channels_count: 2 };
+    content.extend_from_slice(header.binary_serialize_to_array(binary_serde::Endianness::Big).as_slice());
+    content.extend_from_slice(&[0, 1, 0, 4]); // channel ids 1, 4
+    content.extend_from_slice(&[0, 0]); // footer
+    let (h, ids) = parse_descriptor(&content, HEADER_LENGTH + 6).unwrap();
+    assert_eq!((h.flow_id, h.flow_type, h.channels_count), (3, 2, 2));
+    assert_eq!(ids, vec![1, 4]);
+    // offsets below the header length used to underflow `descr_offset - HEADER_LENGTH`
+    for offset in 0..HEADER_LENGTH {
+      assert!(parse_descriptor(&content, offset).is_none(), "offset {offset}");
+    }
+    assert!(parse_descriptor(&content, usize::MAX).is_none());
+    // every truncation is rejected; the old length check compared the channel *count*
+    // with the bytes left, so a list of 2-byte ids could run past the end
+    for len in 0..content.len() {
+      assert!(parse_descriptor(&content[..len], HEADER_LENGTH + 6).is_none(), "len {len}");
+    }
+    let mut many = content.clone();
+    let count_pos = 6 + FlowDescriptorHeader::SERIALIZED_SIZE - 2;
+    many[count_pos..count_pos + 2].copy_from_slice(&3u16.to_be_bytes());
+    assert!(parse_descriptor(&many, HEADER_LENGTH + 6).is_none());
   }
 
   #[test]
