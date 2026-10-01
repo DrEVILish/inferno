@@ -312,12 +312,9 @@ impl<'s> Multicaster<'s> {
         if let Ok(entry) = entry {
           if entry.file_name().to_string_lossy().starts_with(&required_prefix) {
             if let Ok(content) = std::fs::read_to_string(entry.path()) {
-              let content = content.trim_ascii();
-              if content.len() >= 12 {
-                if let Ok(master_id) = hex::decode(&content[0..16]) {
-                  master_clock = Some(master_id);
-                  break;
-                }
+              if let Some(master_id) = parse_clock_stats_master(&content) {
+                master_clock = Some(master_id);
+                break;
               }
             }
           }
@@ -325,7 +322,6 @@ impl<'s> Multicaster<'s> {
       }
     }
     if let Some(mc) = master_clock {
-      assert_eq!(mc.len(), 8);
       let mut bytes = ByteBuffer::new();
       bytes.set_endian(bytebuffer::Endian::BigEndian);
       bytes.write_bytes(&[
@@ -374,6 +370,15 @@ impl<'s> Multicaster<'s> {
       )
       .await;
   }
+}
+
+/// The master clock identity (8 bytes) from the first 16 hex digits of a
+/// `/tmp/clock-stats.*` file. This runs on every clock stats request from the
+/// network, so a short or non-ASCII file must not panic (it used to check for
+/// 12 characters, then slice 16 bytes, then assert the decoded length).
+fn parse_clock_stats_master(content: &str) -> Option<[u8; 8]> {
+  let digits = content.trim_ascii().get(0..16)?;
+  hex::decode(digits).ok()?.try_into().ok()
 }
 
 pub async fn run_server(
@@ -445,5 +450,22 @@ pub async fn run_server(
       }
       // TODO receive shutdown properly, currently Ctrl-C doesn't work if there is error binding to socket
     };
+  }
+}
+
+#[cfg(test)]
+mod clock_stats_tests {
+  use super::parse_clock_stats_master;
+
+  #[test]
+  fn clock_stats_master_id() {
+    assert_eq!(
+      parse_clock_stats_master("  001dc1fffe112233 rest\n"),
+      Some([0x00, 0x1d, 0xc1, 0xff, 0xfe, 0x11, 0x22, 0x33])
+    );
+    for bad in ["", "001dc1fffe11", "001dc1fffe11223", "zz1dc1fffe112233", "001dc1fffe1122ä3", "ääääääää"]
+    {
+      assert_eq!(parse_clock_stats_master(bad), None, "{bad:?}");
+    }
   }
 }
