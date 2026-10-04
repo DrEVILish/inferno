@@ -100,6 +100,14 @@ impl<'s> Multicaster<'s> {
     self.server.send(&dst, pkt).await;
   }
 
+  // Audio capability status (class 0x0724) answering a sample-rate or
+  // encoding probe. Without an answer netaudio shows no rate or encoding
+  // for the device (U2).
+  async fn send_capability_status(&mut self, status: u8, current: u32, supported: &[u32]) {
+    let content = capability_status_content(current, supported);
+    self.send(self.device_info_destination, 0xffff, [0x07, 0x24, 0x00, status, 0, 0, 0, 0], &content).await;
+  }
+
   async fn send_board_info(&mut self) {
     let mut content = [0u8; 200];
     // Firmware version:
@@ -422,6 +430,16 @@ pub async fn run_server(
           [0x07, _, 0, 0x13, 0, 0, 0, _] => {
             mcaster.send_network_info().await;
           }
+          [0x07, _, 0, 0x81, 0, 0, 0, _] => {
+            // sample-rate probe (netaudio probe_sample_rate) -> status 0x80
+            let rate = mcaster.self_info.sample_rate;
+            mcaster.send_capability_status(0x80, rate, &[rate]).await;
+          }
+          [0x07, _, 0, 0x83, 0, 0, 0, _] => {
+            // encoding probe -> status 0x82
+            let enc = mcaster.self_info.bits_per_sample as u32;
+            mcaster.send_capability_status(0x82, enc, &[16, 24, 32]).await;
+          }
           [0x07, _, 0, 0x77, 0, 0, 0, _]=> {
             mcaster.send(
               mcaster.device_info_destination, 0xffff, [0x07, 0x2a, 0x00, 0x78, 0, 0, 0, 0],
@@ -467,5 +485,48 @@ mod clock_stats_tests {
     {
       assert_eq!(parse_clock_stats_master(bad), None, "{bad:?}");
     }
+  }
+}
+
+/// Content of an audio capability status reply: u16 0x0018, u16 count,
+/// u32 current, u32 0, u32 0x00020000, then count x u32 supported values.
+fn capability_status_content(current: u32, supported: &[u32]) -> Vec<u8> {
+  let mut content = Vec::with_capacity(16 + 4 * supported.len());
+  content.extend_from_slice(&0x0018u16.to_be_bytes());
+  content.extend_from_slice(&(supported.len() as u16).to_be_bytes());
+  content.extend_from_slice(&current.to_be_bytes());
+  content.extend_from_slice(&0u32.to_be_bytes());
+  content.extend_from_slice(&0x00020000u32.to_be_bytes());
+  for v in supported {
+    content.extend_from_slice(&v.to_be_bytes());
+  }
+  content
+}
+
+#[cfg(test)]
+mod capability_tests {
+  use super::capability_status_content;
+
+  #[test]
+  fn sample_rate_status_layout() {
+    let c = capability_status_content(48000, &[48000]);
+    assert_eq!(
+      c,
+      [
+        0x00, 0x18, 0x00, 0x01, // marker, one supported value
+        0x00, 0x00, 0xbb, 0x80, // current 48000
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, // fixed words
+        0x00, 0x00, 0xbb, 0x80, // supported 48000
+      ]
+    );
+  }
+
+  #[test]
+  fn encoding_status_lists_every_supported_value() {
+    let c = capability_status_content(24, &[16, 24, 32]);
+    assert_eq!(c.len(), 16 + 12);
+    assert_eq!(&c[2..4], &[0, 3]);
+    assert_eq!(&c[4..8], &24u32.to_be_bytes());
+    assert_eq!(&c[16..], &[0, 0, 0, 16, 0, 0, 0, 24, 0, 0, 0, 32]);
   }
 }
