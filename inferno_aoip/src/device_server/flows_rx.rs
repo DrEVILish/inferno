@@ -54,6 +54,10 @@ struct SocketData<P: ProxyToSamplesBuffer> {
 struct SilenceWriter<P: ProxyToSamplesBuffer> {
   sink: RBInput<Sample, P>,
   end_timestamp: Clock,
+  /// The disconnected channel's timestamp_shift: received samples were
+  /// written this far ahead of the media clock (start offset + latency), and
+  /// the silence must be written as far ahead, or the reader overtakes it.
+  timestamp_shift: ClockDiff,
 }
 
 enum Command<P: ProxyToSamplesBuffer> {
@@ -175,6 +179,21 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
   async fn take_command(receiver: &mut mpsc::Receiver<Command<P>>) -> Command<P> {
     receiver.recv().await.unwrap_or(Command::Shutdown)
   }
+  /// Takes over a disconnected sink and writes silence into it until the
+  /// reader has passed everything the channel had buffered.
+  fn start_silence_writer(&mut self, sink: RBInput<Sample, P>, timestamp_shift: ClockDiff) {
+    if let Some(now) = self.clock.wrapping_now_in_timebase(self.sample_rate.into()) {
+      let rb_size = sink.ring_buffer_size();
+      self.silence_writers.push(SilenceWriter {
+        sink,
+        end_timestamp: now.wrapping_add(rb_size + rb_size / 2 /*TODO: ???*/).wrapping_add_signed(timestamp_shift),
+        timestamp_shift,
+      });
+    } else {
+      warn!("no media clock, unable to initialize SilenceWriter");
+    }
+  }
+
   fn run(&mut self, mut start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>) {
     let keepalive_interval_between_flows = KEEPALIVE_INTERVAL / self.sockets.len().try_into().unwrap();
     let mut next_keepalive = Instant::now() + keepalive_interval_between_flows;
@@ -190,6 +209,23 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
       })
       .unwrap_or(CLOSING_SAMPLES_INTERVAL);
     let mut next_closing_samples = Instant::now() + closing_samples_interval;
+    // How far ahead of the media clock holes are closed. With an external
+    // buffer (the ALSA plugin) the application reads the ring directly, up
+    // to about ts, and moves on by one closing interval between closing
+    // ticks; closing only up to ts let each read run past the last close
+    // into slots still holding audio from one ring-buffer cycle earlier
+    // (teodly/inferno#41: clicks when a flow stops or is disconnected). Two
+    // intervals of lead keep the reader behind the close. Closing ahead
+    // cannot destroy audio: items already written are kept, and a packet
+    // arriving for a closed slot still overwrites it. Readers of an owned
+    // buffer (inferno2pipe) are gated by readable_pos instead and never see
+    // unclosed slots, so they keep the original behaviour (no lead), which
+    // also keeps readable_pos from running ahead of received data.
+    let closing_lead_samples: usize = if self.on_transfer.is_some() {
+      ((closing_samples_interval.as_nanos() * 2 * self.sample_rate as u128) / 1_000_000_000) as usize
+    } else {
+      0
+    };
     let mut events = mio::Events::with_capacity(MAX_FLOWS + 1); // +1 because of waker, TODO: really necessary?
     let mut may_have_command = false;
     let mut start_timestamp = None;
@@ -353,18 +389,8 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
                     ch.sinks.iter().position(|sink| Arc::ptr_eq(sink.shared(), &rb_shared));
                   if let Some(sink_index) = sink_index_opt {
                     let sink = ch.sinks.swap_remove(sink_index);
-                    if let Some(now) = self.clock.wrapping_now_in_timebase(self.sample_rate.into()) {
-                      let rb_size = sink.ring_buffer_size();
-                      let writer = SilenceWriter {
-                        sink,
-                        end_timestamp: now
-                          .wrapping_add(rb_size + rb_size / 2 /*TODO: ???*/)
-                          .wrapping_add_signed(ch.timestamp_shift),
-                      };
-                      self.silence_writers.push(writer);
-                    } else {
-                      warn!("no media clock, unable to initialize SilenceWriter");
-                    }
+                    let shift = ch.timestamp_shift;
+                    self.start_silence_writer(sink, shift);
                   }
                 }
               }
@@ -391,15 +417,28 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
           // However, if the stream breaks, it will ensure that buffer is filled with zeros
           for sd in self.sockets.iter_mut().filter_map(|opt| opt.as_mut()) {
             for ch in sd.channels.iter_mut().filter_map(|opt| opt.as_mut()) {
+              let until = ts.wrapping_add(closing_lead_samples);
               for sink in &mut ch.sinks {
-                sink.close_items_until(ts);
+                sink.close_items_until(until);
               }
             }
           }
 
           let mut finished = None;
           for (index, sw) in self.silence_writers.iter_mut().enumerate() {
-            sw.sink.close_items_until(ts);
+            // Silence a disconnected channel up to where received samples
+            // would have been written by now (media clock + timestamp_shift,
+            // i.e. ts + latency), not just up to ts. The reader consumes up
+            // to ~ts between closing ticks; when the silence stopped at ts,
+            // each read ran a few samples past the last tick into slots
+            // still holding audio from one ring-buffer cycle earlier, and
+            // played them as clicks until the writer finished
+            // (teodly/inferno#41). Zeroing ahead never removes the real
+            // tail: close_items_until keeps already-written items and only
+            // fills unconditionally beyond the last write.
+            sw.sink.close_items_until(
+              now_ts.wrapping_add_signed(sw.timestamp_shift).wrapping_add(closing_lead_samples),
+            );
             if wrapped_diff(ts, sw.end_timestamp) >= 0 {
               finished = Some(index);
             }
