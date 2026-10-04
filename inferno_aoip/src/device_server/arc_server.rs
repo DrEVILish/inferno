@@ -131,7 +131,7 @@ pub async fn run_server(
             &mut conn,
             request.content(),
             if subscriber.is_some() {
-              self_info.rx_channels.len().min(32).try_into().unwrap()
+              self_info.rx_channels.len().min(RX_CHANNELS_PAGE_SIZE).try_into().unwrap()
             } else {
               0
             },
@@ -179,7 +179,7 @@ pub async fn run_server(
           paginate_respond(
             &mut conn,
             request.content(),
-            self_info.tx_channels.len().min(32).try_into().unwrap(),
+            self_info.tx_channels.len().min(TX_CHANNELS_PAGE_SIZE).try_into().unwrap(),
             self_info.tx_channels.iter().enumerate(),
             |(channel_index, ch), bytes| {
               if common_descriptor_offset == 0 {
@@ -205,7 +205,7 @@ pub async fn run_server(
           paginate_respond(
             &mut conn,
             request.content(),
-            self_info.tx_channels.len().min(32).try_into().unwrap(),
+            self_info.tx_channels.len().min(TX_CHANNELS_PAGE_SIZE).try_into().unwrap(),
             self_info.tx_channels.iter().enumerate(),
             |(channel_index, ch), bytes| {
               if !wrote {
