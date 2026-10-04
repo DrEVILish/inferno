@@ -320,21 +320,21 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
             Command::RemoveSocket { index } => {
               self.poll.registry().deregister(&mut self.sockets[index].as_mut().unwrap().socket).unwrap();
               let socket = self.sockets[index].take().unwrap();
-              if cfg!(debug_assertions) {
-                let count: usize = socket
-                  .channels
-                  .iter()
-                  .filter_map(|ch_opt| ch_opt.as_ref())
-                  .map(|ch| ch.sinks.len())
-                  .sum();
-                if count > 0 {
-                  error!(
-                    "BUG: still have {} channels when removing socket index {index}",
-                    socket.channels.len()
-                  );
+              // A channel's DisconnectChannel is sent from a spawned task
+              // (ExternalBuffering::disconnect_channel), so when the last
+              // channel of a flow is unsubscribed this RemoveSocket can
+              // arrive first. Dropping the socket then dropped the sinks
+              // with it: no SilenceWriter ever ran, the late disconnect
+              // found no socket, and the reader replayed the ring buffer's
+              // last cycle forever (teodly/inferno#41). Silence any sink
+              // still attached, exactly as a disconnect would.
+              for ch in socket.channels.into_iter().flatten() {
+                let shift = ch.timestamp_shift;
+                for sink in ch.sinks {
+                  debug!("socket {index} removed with a channel still connected; silencing it");
+                  self.start_silence_writer(sink, shift);
                 }
               }
-              let _ = socket;
             }
             Command::ConnectChannel { socket_index, channel_in_flow, sink } => {
               if cfg!(debug_assertions) {
