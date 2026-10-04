@@ -194,6 +194,35 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
     }
   }
 
+  /// Applies a newly learned start time to everything connected before it:
+  /// each channel's timestamp_shift, and the position of each sink's ring
+  /// buffer (reset as a fresh connect would be), so the positions,
+  /// hole closing and SilenceWriters all use the same timeline.
+  fn rebase_to_start_time(&mut self, start_time: Clock) {
+    let now = self.clock.wrapping_now_in_timebase(self.sample_rate.into());
+    for socket_data in self.sockets.iter_mut().filter_map(|opt| opt.as_mut()) {
+      for channel in socket_data.channels.iter_mut().filter_map(|opt| opt.as_mut()) {
+        channel.timestamp_shift = (0 as ClockDiff)
+          .wrapping_sub_unsigned(start_time)
+          .wrapping_add_unsigned(channel.latency_samples.try_into().unwrap());
+        if let Some(now) = now {
+          for sink in &channel.sinks {
+            sink.shared().reset(now.wrapping_add_signed(channel.timestamp_shift));
+          }
+        }
+      }
+    }
+    // Writers that exist now were started before the start time was known,
+    // so their shift and end lack the -start_time term: same rebase.
+    for sw in &mut self.silence_writers {
+      sw.timestamp_shift = sw.timestamp_shift.wrapping_sub_unsigned(start_time);
+      sw.end_timestamp = sw.end_timestamp.wrapping_sub(start_time);
+      if let Some(now) = now {
+        sw.sink.shared().reset(now.wrapping_add_signed(sw.timestamp_shift));
+      }
+    }
+  }
+
   fn run(&mut self, mut start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>) {
     let keepalive_interval_between_flows = KEEPALIVE_INTERVAL / self.sockets.len().try_into().unwrap();
     let mut next_keepalive = Instant::now() + keepalive_interval_between_flows;
@@ -229,6 +258,9 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
     let mut events = mio::Events::with_capacity(MAX_FLOWS + 1); // +1 because of waker, TODO: really necessary?
     let mut may_have_command = false;
     let mut start_timestamp = None;
+    // Received samples are written only once the start time is known: ring
+    // buffer positions count from it (ALSA starts counting from 0).
+    let mut awaiting_start = start_time_rx.is_some();
 
     set_current_thread_realtime(80);
     loop {
@@ -248,40 +280,39 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
         }
       }
 
+      // Learn the start time before handling any command. It used to be
+      // checked only when a network packet arrived, so a ConnectChannel
+      // handled before the first packet reset its ring buffer on the
+      // absolute media-clock timeline. Correcting timestamp_shift later did
+      // not move that position: the channel's hole closing and its
+      // SilenceWriter then worked on the wrong timeline, and after a
+      // disconnect the reader replayed the buffer's last cycle forever
+      // (teodly/inferno#41). Which channels were hit depended on whether
+      // their connect raced the first packet.
+      if let Some(rx) = &mut start_time_rx {
+        match rx.try_recv() {
+          Ok(start_time) => {
+            start_timestamp = Some(start_time);
+            start_time_rx = None;
+            awaiting_start = false;
+            self.rebase_to_start_time(start_time);
+          }
+          Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+          Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+            // The stream stopped before it started (plugin_stop drops the
+            // sender). This used to panic the realtime receive thread.
+            // There is no timeline to write on, so keep writes disabled.
+            warn!("start time channel closed before a start time arrived; not writing received samples");
+            start_time_rx = None;
+          }
+        }
+      }
+
       for event in &events {
         if event.token() == WAKE_TOKEN {
           may_have_command = true;
         } else {
           // received a packet from the network
-          if let Some(rx) = &mut start_time_rx {
-            // need to get start time to compute (ringbuffer_position - media_clock) difference
-            // (because ALSA starts counting from 0)
-            match rx.try_recv() {
-              Ok(start_time) => {
-                start_timestamp = Some(start_time);
-                for socket_opt in &mut self.sockets {
-                  if let Some(socket_data) = socket_opt {
-                    for channel_opt in &mut socket_data.channels {
-                      if let Some(channel) = channel_opt {
-                        channel.timestamp_shift = (0 as ClockDiff)
-                          .wrapping_sub_unsigned(start_time)
-                          .wrapping_add_unsigned(channel.latency_samples.try_into().unwrap())
-                          as ClockDiff;
-                        // FIXME DRY
-                      }
-                    }
-                  }
-                }
-              }
-              Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
-              Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                panic!("channel closed, unable to get start timestamp for ring buffer input");
-              }
-            }
-          }
-          if start_timestamp.is_some() {
-            start_time_rx = None;
-          }
           let socket_index = event.token().0;
           if let Some(socket_data) = &mut self.sockets[socket_index] {
             // always run receive to prevent network queue fill when waiting for start_time_rx
@@ -291,7 +322,7 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
               self.sample_rate,
               &mut self.clock,
               self.ref_instant,
-              start_time_rx.is_none(),
+              !awaiting_start,
             );
           } else {
             warn!("got token not bound to any existing socket");
@@ -408,7 +439,7 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
 
       let now = Instant::now();
 
-      if start_time_rx.is_none() && now >= next_closing_samples {
+      if !awaiting_start && now >= next_closing_samples {
         if let Some(now_ts) = self.clock.wrapping_now_in_timebase(self.sample_rate.into()) {
           let ts = now_ts.wrapping_sub(start_timestamp.unwrap_or(0));
 
