@@ -486,7 +486,7 @@ fn invalid_input(e: FlowLayoutError) -> std::io::Error {
   std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FlowInfo {
   pub rx_hostname: Option<String>,
   pub rx_flow_name: Option<String>,
@@ -499,6 +499,20 @@ impl FlowInfo {
   fn is_multicast(&self) -> bool {
     self.rx_hostname.is_none() && self.rx_flow_name.is_none()
   }
+}
+
+/// A unicast flow as it stood when its transmitter stopped. The next
+/// transmitter re-creates it with the same index and cookie (see
+/// FlowsTransmitter::restore), so the handle a receiver holds stays valid
+/// across a transmitter restart.
+#[derive(Debug, Clone)]
+pub struct SavedFlow {
+  index: u32,
+  cookie: u16,
+  remote: SocketAddr,
+  fpp: usize,
+  bytes_per_sample: usize,
+  info: FlowInfo,
 }
 
 pub struct FlowsTransmitter {
@@ -804,6 +818,95 @@ impl FlowsTransmitter {
       self.remove_flow_internal(id).await;
     }
   }
+  /// The live unicast flows, for the next transmitter to restore. Multicast
+  /// flows are restored by TransmitMulticasts from its own state, and
+  /// expired flows have no receiver left to keep.
+  pub fn snapshot(&self) -> Vec<SavedFlow> {
+    self
+      .flows
+      .iter()
+      .filter_map(|(&index, flow)| {
+        let info = self.flows_info.get(index as usize)?.as_ref()?;
+        if info.is_multicast() || flow.expired.load(Ordering::Acquire) {
+          return None;
+        }
+        Some(SavedFlow {
+          index,
+          cookie: flow.cookie,
+          remote: flow.remote,
+          fpp: flow.fpp,
+          bytes_per_sample: flow.bytes_per_sample,
+          info: info.clone(),
+        })
+      })
+      .collect()
+  }
+
+  /// Re-creates saved flows with their original index and cookie, so their
+  /// receivers keep streaming (and their keepalives keep matching) across a
+  /// transmitter restart. A flow whose layout no longer fits this
+  /// transmitter, or whose slot or destination is already taken, is
+  /// skipped. Returns how many were restored.
+  pub async fn restore(&mut self, saved: Vec<SavedFlow>) -> usize {
+    let mut restored = 0;
+    for flow in saved {
+      if flow.index >= MAX_FLOWS
+        || self.flows.contains_key(&flow.index)
+        || self.ip_port_to_id.contains_key(&flow.remote)
+      {
+        warn!("not restoring flow {} to {}: slot or destination in use", flow.index, flow.remote);
+        continue;
+      }
+      if let Err(e) =
+        validate_flow_layout(&flow.info.local_channel_indices, flow.fpp, flow.bytes_per_sample, self.num_channels)
+      {
+        warn!("not restoring flow {} to {}: {e}", flow.index, flow.remote);
+        continue;
+      }
+      let socket = match UdpSocket::bind(SocketAddr::new(IpAddr::V4(self.self_info.ip_address), 0))
+        .and_then(|sock| sock.connect(flow.remote).map(|_| sock))
+        .and_then(|sock| sock.set_nonblocking(true).map(|_| sock))
+      {
+        Ok(sock) => sock,
+        Err(e) => {
+          warn!("not restoring flow {} to {}: {e}", flow.index, flow.remote);
+          continue;
+        }
+      };
+      let expired = Arc::new(AtomicBool::new(false));
+      if self
+        .commands_sender
+        .send(Command::AddFlow {
+          index: flow.index as usize,
+          socket,
+          channel_indices: flow.info.local_channel_indices.clone(),
+          fpp: flow.fpp,
+          bytes_per_sample: flow.bytes_per_sample,
+          needs_keepalives: true,
+          expired: expired.clone(),
+        })
+        .await
+        .is_err()
+      {
+        break;
+      }
+      self.flows.insert(
+        flow.index,
+        FlowData {
+          cookie: flow.cookie,
+          remote: flow.remote,
+          expired,
+          fpp: flow.fpp,
+          bytes_per_sample: flow.bytes_per_sample,
+        },
+      );
+      self.ip_port_to_id.insert(flow.remote, flow.index);
+      self.flows_info[flow.index as usize] = Some(flow.info);
+      restored += 1;
+    }
+    restored
+  }
+
   pub fn is_empty(&self) -> bool {
     self.flows.is_empty()
   }
@@ -846,5 +949,103 @@ mod layout_tests {
     // 9 + n * 4 * 2 <= MTU  =>  n = 186 fits, 187 does not
     assert_eq!(validate_flow_layout(&vec![None; 186], 2, 4, 1), Ok(()));
     assert!(validate_flow_layout(&vec![None; 187], 2, 4, 1).is_err());
+  }
+}
+
+#[cfg(test)]
+mod restart_tests {
+  use super::*;
+  use netdev::mac::MacAddr;
+
+  fn device_info() -> DeviceInfo {
+    DeviceInfo {
+      ip_address: Ipv4Addr::LOCALHOST,
+      netmask: Ipv4Addr::UNSPECIFIED,
+      gateway: Ipv4Addr::UNSPECIFIED,
+      mac_address: MacAddr::zero(),
+      link_speed: 0,
+      board_name: String::new(),
+      manufacturer: String::new(),
+      model_name: String::new(),
+      model_number: String::new(),
+      factory_device_id: [0; 8],
+      process_id: 0,
+      vendor_string: String::new(),
+      friendly_hostname: String::new(),
+      factory_hostname: String::new(),
+      rx_channels: Vec::new(),
+      tx_channels: Vec::new(),
+      bits_per_sample: 24,
+      pcm_type: 0,
+      latency_ns: 10_000_000,
+      sample_rate: 48000,
+      arc_port: 0,
+      cmc_port: 0,
+      flows_control_port: 0,
+      info_request_port: 0,
+    }
+  }
+
+  // A FlowsTransmitter without its TX thread: the receiver end of its
+  // command channel stands in, so the commands it would send can be checked.
+  fn transmitter(num_channels: usize) -> (FlowsTransmitter, mpsc::Receiver<Command>) {
+    let (tx, rx) = mpsc::channel(32);
+    (
+      FlowsTransmitter {
+        self_info: Arc::new(device_info()),
+        flow_seq_id: 0.into(),
+        flows: BTreeMap::new(),
+        ip_port_to_id: BTreeMap::new(),
+        commands_sender: tx,
+        flows_info: (0..MAX_FLOWS).map(|_| None).collect(),
+        num_channels,
+      },
+      rx,
+    )
+  }
+
+  fn unicast(port: u16, channels: Vec<Option<usize>>) -> FlowInfo {
+    FlowInfo {
+      rx_hostname: Some("pi-b".into()),
+      rx_flow_name: Some("f".into()),
+      dst_addr: Ipv4Addr::LOCALHOST,
+      dst_port: port,
+      local_channel_indices: channels,
+    }
+  }
+
+  #[tokio::test]
+  async fn restart_keeps_unicast_flows_with_their_handles() {
+    let (mut old, _old_rx) = transmitter(2);
+    let (_, handle) = old.add_flow(unicast(41001, vec![Some(0), Some(1)]), 32, 3, None, false).await.unwrap();
+    let (gone_idx, _) = old.add_flow(unicast(41002, vec![Some(0)]), 32, 3, None, false).await.unwrap();
+    old.flows.get(&(gone_idx as u32)).unwrap().expired.store(true, Ordering::Release); // receiver gone
+    let multicast = FlowInfo { rx_hostname: None, rx_flow_name: None, ..unicast(41003, vec![Some(1)]) };
+    old.add_flow(multicast, 32, 3, None, true).await.unwrap();
+
+    let saved = old.snapshot();
+    assert_eq!(saved.len(), 1, "only the live unicast flow is kept: {saved:?}");
+
+    let (mut new, mut new_rx) = transmitter(2);
+    assert_eq!(new.restore(saved.clone()).await, 1);
+    let index = u32::from_be_bytes(handle[0..4].try_into().unwrap());
+    let cookie = u16::from_be_bytes(handle[4..6].try_into().unwrap());
+    let flow = new.flows.get(&index).expect("flow restored at its old index");
+    assert_eq!(flow.cookie, cookie, "same cookie, so the receiver's handle still matches");
+    assert_eq!(new.ip_port_to_id.get(&"127.0.0.1:41001".parse().unwrap()), Some(&index));
+    assert_eq!(new.flows_info[index as usize].as_ref().unwrap().local_channel_indices, vec![Some(0), Some(1)]);
+    match new_rx.try_recv() {
+      Ok(Command::AddFlow { index: i, needs_keepalives, fpp, bytes_per_sample, .. }) => {
+        assert_eq!((i, needs_keepalives, fpp, bytes_per_sample), (index as usize, true, 32, 3));
+      }
+      other => panic!("expected AddFlow for the TX thread, got {other:?}"),
+    }
+
+    // restoring again finds the slot taken and does not duplicate it
+    assert_eq!(new.restore(saved.clone()).await, 0);
+    // a transmitter that no longer has channel 1 refuses the flow
+    let (mut narrow, _rx) = transmitter(1);
+    assert_eq!(narrow.restore(saved).await, 0);
+    assert!(narrow.flows.is_empty());
   }
 }

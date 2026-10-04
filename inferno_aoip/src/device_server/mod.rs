@@ -115,6 +115,8 @@ pub struct DeviceServer {
   tx_peaks_supplier: Arc<RwLock<Box<dyn Fn() -> Vec<u8> + Send + Sync>>>,
   shutdown_todo: Pin<Box<dyn Future<Output = ()> + Send>>,
   tx_shutdown_todo: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+  /// Unicast flows of the last stopped transmitter, restored by the next.
+  saved_tx_flows: Arc<std::sync::Mutex<Vec<flows_tx::SavedFlow>>>,
   rx_shutdown_todo: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 }
 
@@ -232,6 +234,7 @@ impl DeviceServer {
       shutdown_todo,
       rx_shutdown_todo: None,
       tx_shutdown_todo: None,
+      saved_tx_flows: Default::default(),
     }
   }
 
@@ -355,7 +358,7 @@ impl DeviceServer {
   ) {
     let clock_rx = self.clock_receiver.subscribe();
 
-    let (flows_tx_handle, flows_tx_thread) = flows_tx::FlowsTransmitter::start(
+    let (mut flows_tx_handle, flows_tx_thread) = flows_tx::FlowsTransmitter::start(
       self.self_info.clone(),
       self.tx_latency_ns.try_into().unwrap(),
       self.tx_source_bit_depth,
@@ -365,6 +368,15 @@ impl DeviceServer {
       current_timestamp.clone(),
       on_transfer,
     );
+    // A transmitter restart (the ALSA plugin restarts it to recover from an
+    // underrun) used to drop every flow: each receiver went silent until
+    // its keepalive timed out and it re-requested, ~4-5 s later. Re-create
+    // the previous transmitter's unicast flows with the same handles.
+    let saved = std::mem::take(&mut *self.saved_tx_flows.lock().unwrap());
+    if !saved.is_empty() {
+      let restored = flows_tx_handle.restore(saved).await;
+      info!("transmitter restarted with {restored} flow(s) kept");
+    }
     *self.flows_tx.lock().await = Some(flows_tx_handle);
     let txm = TransmitMulticasts::new(
       self.tx_multicasts_by_channel.clone(),
@@ -411,6 +423,7 @@ impl DeviceServer {
     }).unwrap(); */
     let flows_tx = self.flows_tx.clone();
     let tx_multicasts = self.tx_multicasts.clone();
+    let saved_tx_flows = self.saved_tx_flows.clone();
     self.tx_shutdown_todo = Some(
       async move {
         //peaks_work1.store(false, Ordering::Relaxed);
@@ -419,6 +432,10 @@ impl DeviceServer {
         }
         shutdown_send.send(()).unwrap();
         flows_control_task.await.unwrap();
+        // keep the flows for the next transmitter (see transmit)
+        if let Some(ftx) = flows_tx.lock().await.as_ref() {
+          *saved_tx_flows.lock().unwrap() = ftx.snapshot();
+        }
         *flows_tx.lock().await = None;
         flows_tx_thread.join().unwrap();
         //peaks_thread.join().unwrap();
