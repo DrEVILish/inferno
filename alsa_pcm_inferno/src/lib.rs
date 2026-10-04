@@ -186,6 +186,20 @@ unsafe fn get_private<'a>(io: *mut snd_pcm_ioplug_t) -> &'a mut MyIOPlug {
 
 unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframes_t {
     let this = get_private(io);
+    // ALSA may ask for the pointer before the stream was ever prepared
+    // (snd_pcm_status/snd_pcm_avail right after open - JACK does, see
+    // teodly/inferno#8). There is no stream yet, so nothing has moved.
+    // Unwrapping stream_info here panicked, and a panic in an extern "C"
+    // callback aborts the host process.
+    let Some(boundary_u) = this.stream_info.as_ref().map(|si| si.boundary) else {
+        return 0;
+    };
+    // boundary comes from ALSA as unsigned; ALSA keeps it within the signed
+    // range, but a value that does not fit must not panic either.
+    let Ok(boundary) = snd_pcm_sframes_t::try_from(boundary_u) else {
+        error!("boundary {boundary_u} does not fit in a signed frame count, reporting xrun");
+        return -(EPIPE as snd_pcm_sframes_t);
+    };
     let cur = this
         .current_timestamp
         .load(Ordering::SeqCst /*TODO: really needed?*/);
@@ -232,13 +246,6 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
         //now_samples_opt.map(|now_samples| now_samples.wrapping_sub(this.start_time.unwrap())).unwrap_or(0) as i64
     };
 
-    let boundary: snd_pcm_sframes_t = this
-        .stream_info
-        .as_ref()
-        .unwrap()
-        .boundary
-        .try_into()
-        .unwrap();
     let max_diff = boundary >> 2;
     let appl_ptr = ((*io).appl_ptr as snd_pcm_sframes_t)
         .wrapping_add(this.stream_info.as_ref().unwrap().boundary_add.0);
