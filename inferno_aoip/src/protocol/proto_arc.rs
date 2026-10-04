@@ -329,6 +329,22 @@ pub mod remove_rx_subscriptions {
         .collect(),
     )
   }
+
+  /// Splits the requested channel ids (1-based) into local channel indices to
+  /// unsubscribe and ids that name no receive channel. A bulk remove names
+  /// every channel; acting on the first id only left the rest subscribed (U1).
+  pub fn local_channel_indices(ids: &[u32], rx_channels: usize) -> (Vec<usize>, Vec<u32>) {
+    let mut valid = Vec::with_capacity(ids.len());
+    let mut invalid = Vec::new();
+    for &id in ids {
+      if id == 0 || id as usize > rx_channels {
+        invalid.push(id);
+      } else {
+        valid.push((id - 1) as usize);
+      }
+    }
+    (valid, invalid)
+  }
 }
 
 pub mod query_rx_flows {
@@ -830,6 +846,16 @@ mod tests {
     // count larger than the ids present (the old handler read content[4..6] unchecked)
     assert_eq!(parse_channel_ids(&[0xff, 0xff, 0, 0]), Some(vec![]));
     assert_eq!(parse_channel_ids(&[0, 3, 0, 0, 0, 7, 0]), Some(vec![7]));
+  }
+
+  #[test]
+  fn bulk_unsubscribe_takes_every_channel() {
+    use remove_rx_subscriptions::{local_channel_indices, parse_channel_ids};
+    // netaudio's bulk remove of channels 1-3 on a 32-channel receiver
+    let ids = parse_channel_ids(&[0, 3, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3]).unwrap();
+    assert_eq!(local_channel_indices(&ids, 32), (vec![0, 1, 2], vec![]));
+    // ids outside the device are reported, the rest still handled
+    assert_eq!(local_channel_indices(&[0, 2, 33], 32), (vec![1], vec![0, 33]));
   }
 
   #[test]

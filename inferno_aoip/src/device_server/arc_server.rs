@@ -719,23 +719,29 @@ pub async fn run_server(
           // whole packet: "27ff00104a1c30140000000100000002"
           if let Some(channels_recv) = &subscriber {
             let content = request.content();
-            let local_channel = match remove_rx_subscriptions::parse_channel_ids(content)
-              .and_then(|ids| ids.first().copied())
-            {
-              Some(id) => id,
-              None => {
+            let ids = match remove_rx_subscriptions::parse_channel_ids(content) {
+              Some(ids) if !ids.is_empty() => ids,
+              _ => {
                 error!("0x3014: no channel in request: {}", hex::encode(content));
                 conn.respond_with_code(0xFFFF /* TODO */, &[]).await;
                 continue;
               }
             };
-            if local_channel == 0 || local_channel as usize > self_info.rx_channels.len() {
-              error!("0x3014: disconnect requested for nonexisting channel {local_channel}");
+            // A bulk remove names every channel; only the first used to be
+            // unsubscribed (U1).
+            let (indices, invalid) =
+              remove_rx_subscriptions::local_channel_indices(&ids, self_info.rx_channels.len());
+            for id in &invalid {
+              error!("0x3014: disconnect requested for nonexisting channel {id}");
+            }
+            if indices.is_empty() {
               conn.respond_with_code(0xFFFF /* TODO */, &[]).await;
               continue;
             }
-            info!("disconnect requested: local channel {}", local_channel);
-            channels_recv.unsubscribe((local_channel - 1) as usize).await;
+            for local_channel_index in indices {
+              info!("disconnect requested: local channel {}", local_channel_index + 1);
+              channels_recv.unsubscribe(local_channel_index).await;
+            }
             conn.respond(&[]).await;
           }
         }
