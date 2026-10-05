@@ -46,6 +46,10 @@ pub struct DeviceInfo {
   /// Product version announced to controllers (major, minor, patch), e.g.
   /// the host application's own version; None = this crate's version.
   pub product_version: Option<(u8, u8, u16)>,
+
+  /// Where a controller's rename request is handed to the host application
+  /// (NAME_REQUEST_PATH); None = renaming from a controller is unsupported.
+  pub name_request_path: Option<std::path::PathBuf>,
 }
 
 impl DeviceInfo {
@@ -85,6 +89,7 @@ mod tests {
       flows_control_port: 0,
       info_request_port: 0,
       product_version: None,
+      name_request_path: None,
     }
   }
 
