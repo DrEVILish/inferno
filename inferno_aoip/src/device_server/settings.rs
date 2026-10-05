@@ -141,6 +141,7 @@ fn create_self_info(
     info_request_port: INFO_REQUEST_PORT,
     product_version: settings.get("PRODUCT_VERSION").and_then(|v| parse_product_version(v)),
     name_request_path: settings.get("NAME_REQUEST_PATH").map(Into::into),
+    state_dir: settings.get("STATE_DIR").map(Into::into),
   };
 
   if let Some(altport) = settings.get("ALT_PORT").map(|s| s.parse().expect("ALT_PORT must be u16")) {

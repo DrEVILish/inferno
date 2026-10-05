@@ -691,6 +691,7 @@ mod tests {
       info_request_port: 8700,
       product_version: None,
       name_request_path: None,
+      state_dir: None,
     };
     let desc = CommonChannelsDescriptor::new(&device);
     assert_eq!(desc.sample_rate, 48000);
