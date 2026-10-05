@@ -42,6 +42,10 @@ pub struct DeviceInfo {
   pub cmc_port: u16,
   pub flows_control_port: u16,
   pub info_request_port: u16,
+
+  /// Product version announced to controllers (major, minor, patch), e.g.
+  /// the host application's own version; None = this crate's version.
+  pub product_version: Option<(u8, u8, u16)>,
 }
 
 impl DeviceInfo {
@@ -80,6 +84,7 @@ mod tests {
       cmc_port: 0,
       flows_control_port: 0,
       info_request_port: 0,
+      product_version: None,
     }
   }
 
