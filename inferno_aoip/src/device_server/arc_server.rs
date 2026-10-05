@@ -521,6 +521,36 @@ pub async fn run_server(
           conn.respond_with_code(0x30, &[]).await;
         }
 
+        0x1001 => {
+          // Set device name (content: the name, NUL-terminated; protocol
+          // 0x2809) or, with no content, reset it to the factory name.
+          // The name lives with the host application (it is in NAME and in
+          // the mDNS records, flows and channel instance names), so the
+          // request is handed to the host through NAME_REQUEST_PATH: a
+          // one-line file holding the new name, empty for a reset. The
+          // host renames and restarts the device.
+          let code = match &self_info.name_request_path {
+            None => 0x30, // unsupported
+            Some(path) => match requested_device_name(request.content()) {
+              Err(why) => {
+                warn!("refusing device rename: {why}");
+                0x30
+              }
+              Ok(name) => match write_name_request(path, &name) {
+                Ok(()) => {
+                  info!("device rename requested by a controller: {:?}", name.as_deref().unwrap_or("<factory>"));
+                  1
+                }
+                Err(e) => {
+                  error!("cannot hand rename request to the host ({}): {e}", path.display());
+                  0x30
+                }
+              },
+            },
+          };
+          conn.respond_with_code(code, &[]).await;
+        }
+
         0x2204 => {
           // TX flow labels, asked for by controllers next to the TX flow
           // query (content 0001 0001 0000: first page). It went unanswered
@@ -830,5 +860,60 @@ mod device_settings_tests {
     let body = property_directory_response();
     assert_eq!(u16::from_be_bytes([body[0], body[1]]), 31);
     assert_eq!(body.len(), 2 + 31 * 4);
+  }
+}
+
+/// The name in a set-device-name request: Some(name), or None for a reset
+/// (no content). Names follow the controllers' rules: 1-31 characters,
+/// letters, digits and '-', starting with a letter, not ending in '-'.
+fn requested_device_name(content: &[u8]) -> Result<Option<String>, String> {
+  let raw = match content.iter().position(|&b| b == 0) {
+    Some(end) => &content[..end],
+    None => content,
+  };
+  if raw.is_empty() {
+    return Ok(None);
+  }
+  let name = std::str::from_utf8(raw).map_err(|_| "name is not UTF-8".to_owned())?;
+  let ok_chars = name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+  let starts = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic());
+  if name.len() > 31 || !ok_chars || !starts || name.ends_with('-') {
+    return Err(format!("invalid device name {name:?}"));
+  }
+  Ok(Some(name.to_owned()))
+}
+
+/// Writes the request for the host atomically (temp file + rename), so it
+/// never reads half a name.
+fn write_name_request(path: &std::path::Path, name: &Option<String>) -> std::io::Result<()> {
+  let tmp = path.with_extension("tmp");
+  std::fs::write(&tmp, format!("{}\n", name.as_deref().unwrap_or("")))?;
+  std::fs::rename(&tmp, path)
+}
+
+#[cfg(test)]
+mod rename_tests {
+  use super::*;
+
+  #[test]
+  fn device_name_requests() {
+    assert_eq!(requested_device_name(b"Stage-Left\0"), Ok(Some("Stage-Left".to_owned())));
+    assert_eq!(requested_device_name(b""), Ok(None), "no content is a reset");
+    assert_eq!(requested_device_name(b"\0"), Ok(None));
+    for bad in [&b"9lives\0"[..], b"has space\0", b"trailing-\0", b"under_score\0", &[b'a'; 32][..], b"\xff\xfe\0"] {
+      assert!(requested_device_name(bad).is_err(), "{bad:?}");
+    }
+  }
+
+  #[test]
+  fn name_request_file_is_one_line() {
+    let dir = std::env::temp_dir().join(format!("inferno-rename-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("name-request");
+    write_name_request(&path, &Some("Desk-A".to_owned())).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "Desk-A\n");
+    write_name_request(&path, &None).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "\n");
+    std::fs::remove_dir_all(&dir).unwrap();
   }
 }
