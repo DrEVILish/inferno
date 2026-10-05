@@ -633,41 +633,17 @@ pub async fn run_server(
         }
 
         0x1100 => {
-          // used by DC
-          // received unknown opcode1 0x1100, content 00130201820482050210021182188219830183028306031003110303802100f08060002200630064
-          // whole packet: "272900320e621100000000130201820482050210021182188219830183028306031003110303802100f08060002200630064"
-
-          // ???
-          // looks like something dependent on active connections
-          let content = [0u8; 110];
-          // XXX: not necessary
-          /* let content = [
-            0x12, 0x12, 0x02, 0x01, 0x00, 0x01, 0x82, 0x04, 0x00, 0x54, 0x82, 0x05, 0x00, 0x58,
-            0x02, 0x10, 0x00, 0x10, 0x02, 0x11, 0x00, 0x10, 0x00, 0x00, 0x82, 0x18, 0x00, 0x00,
-            0x82, 0x19, 0x83, 0x01, 0x00, 0x5c, 0x83, 0x02, 0x00, 0x60, 0x83, 0x06, 0x00, 0x64,
-            0x03, 0x10, 0x00, 0x10, 0x03, 0x11, 0x00, 0x10, 0x03, 0x03, 0x00, 0x02, 0x80, 0x21,
-            0x00, 0x68, 0x00, 0x00, 0x00, 0xf0, 0x00, 0x00, 0x80, 0x60, 0x00, 0x22, 0x00, 0x01,
-            0x00, 0x00, 0x00, 0x63, /* 1000000: */ 0x00, 0x0f, 0x42, 0x40, 0x00, 0x0f, 0x42,
-            0x40, 0x00, 0x0f, 0x42, 0x40, 0x01, 0x35, 0xf1, 0xb4, 0x00, 0x0f, 0x42, 0x40, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00,
-          ]; */
-          conn.respond(&content).await;
+          // Device settings, asked for by controllers for the device view
+          // (request content: a page header and the property ids wanted).
+          // It used to answer 110 zero bytes, so controllers showed no
+          // sample rate and no latency. Answer the properties this device
+          // has, values from its settings (see device_settings_response).
+          conn.respond_with_code(1, &device_settings_response(&self_info)).await;
         }
         0x1102 => {
-          // identical for all low channels count devices
-          let content = [0u8; 94];
-          // XXX not necessary
-          /* let content = [
-            /* number of items, 2B: */ 0x00, 0x17, 0x80, 0x20, 0x00, 0x01,
-            0x80, 0x21, 0x00, 0x03, 0x00, 0x22, 0x00, 0x03, 0x00, 0x23, 0x00, 0x03, 0x00, 0x24, 0x00, 0x01,
-            0x02, 0x01, 0x00, 0x03, 0x82, 0x04, 0x00, 0x03, 0x82, 0x05, 0x00, 0x03, 0x02, 0x0a, 0x00, 0x01,
-            0x02, 0x0b, 0x00, 0x01, 0x02, 0x10, 0x00, 0x03, 0x02, 0x11, 0x00, 0x03, 0x02, 0x12, 0x00, 0x03,
-            0x02, 0x13, 0x00, 0x01, 0x02, 0x14, 0x00, 0x01, 0x83, 0x01, 0x00, 0x03, 0x83, 0x06, 0x00, 0x01,
-            0x83, 0x02, 0x00, 0x01, 0x03, 0x10, 0x00, 0x01, 0x03, 0x11, 0x00, 0x01, 0x03, 0x03, 0x00, 0x03,
-            0x83, 0xf0, 0x00, 0x01, 0x06, 0x01, 0x00, 0x01
-          ]; */
-          conn.respond(&content).await;
+          // Property directory: which settings exist and how they may be
+          // used (was 94 zero bytes).
+          conn.respond_with_code(1, &property_directory_response()).await;
         }
         0x3300 => {
           // WTF: this is necessary to avoid 'clock domain mismatch' error in DC
@@ -770,5 +746,89 @@ pub async fn run_server(
       );
       error!("whole packet: {:?}", hex::encode(request.into_storage()));
     }
+  }
+}
+
+/// Latency limits announced to controllers. The device runs at its
+/// configured RX latency; changing it from a controller is not supported.
+const MIN_LATENCY_NS: u32 = 1_000_000;
+const MAX_LATENCY_NS: u32 = 40_000_000;
+const DEFAULT_LATENCY_NS: u32 = 10_000_000;
+
+/// The 0x1100 device settings reply: a record per property (id, offset of
+/// its value from the start of the packet), then the u32 values:
+/// sample rate (0x8020), and default/configured/active/maximum/minimum
+/// latency in ns (0x8204/0x8205/0x8301/0x8302/0x8306).
+fn device_settings_response(self_info: &DeviceInfo) -> Vec<u8> {
+  let latency: u32 = self_info.latency_ns.try_into().unwrap_or(u32::MAX);
+  let settings: [(u16, u32); 6] = [
+    (0x8020, self_info.sample_rate),
+    (0x8204, DEFAULT_LATENCY_NS),
+    (0x8205, latency),
+    (0x8301, latency),
+    (0x8302, MAX_LATENCY_NS),
+    (0x8306, MIN_LATENCY_NS),
+  ];
+  const HEADER: usize = 10; // the ARC header the reply goes out behind
+  let first_value = HEADER + 2 + settings.len() * 4;
+  let mut out = vec![0x02, settings.len() as u8];
+  for (i, (id, _)) in settings.iter().enumerate() {
+    out.extend_from_slice(&id.to_be_bytes());
+    out.extend_from_slice(&((first_value + i * 4) as u16).to_be_bytes());
+  }
+  for (_, value) in settings {
+    out.extend_from_slice(&value.to_be_bytes());
+  }
+  out
+}
+
+/// The 0x1102 property directory: a u16 count, then (property id, flags)
+/// pairs; flags 1 = read, 3 = read/write. The set a hardware interface
+/// announces, as netaudio's virtual device answers it.
+fn property_directory_response() -> Vec<u8> {
+  const PROPERTIES: [(u16, u16); 31] = [
+    (0x8020, 1), (0x8021, 3), (0x0022, 3), (0x0023, 3), (0x0024, 1), (0x8060, 3), (0x0062, 3),
+    (0x0063, 1), (0x0201, 3), (0x8204, 3), (0x8205, 3), (0x020a, 1), (0x020b, 1), (0x0210, 3),
+    (0x0211, 3), (0x0212, 3), (0x0213, 1), (0x0214, 1), (0x0222, 3), (0x8301, 3), (0x8306, 1),
+    (0x8302, 1), (0x8321, 1), (0x0310, 1), (0x0311, 1), (0x0312, 1), (0x0303, 3), (0x83f0, 1),
+    (0x0601, 1), (0x0309, 1), (0x0209, 1),
+  ];
+  let mut out = (PROPERTIES.len() as u16).to_be_bytes().to_vec();
+  for (id, flags) in PROPERTIES {
+    out.extend_from_slice(&id.to_be_bytes());
+    out.extend_from_slice(&flags.to_be_bytes());
+  }
+  out
+}
+
+#[cfg(test)]
+mod device_settings_tests {
+  use super::*;
+
+  #[test]
+  fn device_settings_carry_rate_and_latency() {
+    let mut info = crate::device_server::settings::Settings::new("t", "t", Some(std::net::Ipv4Addr::LOCALHOST), &Default::default()).self_info;
+    info.sample_rate = 48000;
+    info.latency_ns = 10_000_000;
+    let body = device_settings_response(&info);
+    assert_eq!(&body[..2], &[0x02, 6]);
+    // Each record's value offset counts the 10-byte ARC header.
+    let value = |id: u16| {
+      let rec = body[2..2 + 6 * 4].chunks(4).find(|r| u16::from_be_bytes([r[0], r[1]]) == id).unwrap();
+      let off = u16::from_be_bytes([rec[2], rec[3]]) as usize - 10;
+      u32::from_be_bytes(body[off..off + 4].try_into().unwrap())
+    };
+    assert_eq!(value(0x8020), 48000);
+    assert_eq!(value(0x8301), 10_000_000);
+    assert_eq!(value(0x8205), 10_000_000);
+    assert_eq!(value(0x8306), MIN_LATENCY_NS);
+    assert_eq!(value(0x8302), MAX_LATENCY_NS);
+  }
+
+  #[test]
+  fn property_directory_lists_every_property() {
+    let body = property_directory_response();
+    assert_eq!(u16::from_be_bytes([body[0], body[1]]), 31);
+    assert_eq!(body.len(), 2 + 31 * 4);
   }
 }
