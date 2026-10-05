@@ -362,6 +362,7 @@ mod tests {
       info_request_port: 0,
       product_version: None,
       name_request_path: None,
+      state_dir: None,
     }
   }
 

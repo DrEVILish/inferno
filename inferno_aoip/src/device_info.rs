@@ -50,6 +50,10 @@ pub struct DeviceInfo {
   /// Where a controller's rename request is handed to the host application
   /// (NAME_REQUEST_PATH); None = renaming from a controller is unsupported.
   pub name_request_path: Option<std::path::PathBuf>,
+
+  /// Where saved state (channel names, subscriptions) lives (STATE_DIR);
+  /// None = the per-user state dir plus a per-device-id subdirectory.
+  pub state_dir: Option<std::path::PathBuf>,
 }
 
 impl DeviceInfo {
@@ -90,6 +94,7 @@ mod tests {
       info_request_port: 0,
       product_version: None,
       name_request_path: None,
+      state_dir: None,
     }
   }
 

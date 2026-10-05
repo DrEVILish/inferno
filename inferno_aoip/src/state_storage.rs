@@ -19,9 +19,17 @@ pub struct StateStorage {
 
 impl StateStorage {
   pub fn new(self_info: &DeviceInfo) -> Self {
-    let dir = AppDirs::new(Some("inferno_aoip"), false).unwrap().state_dir.to_str().unwrap().to_owned()
-      + MAIN_SEPARATOR_STR
-      + &hex::encode(self_info.factory_device_id);
+    // STATE_DIR pins the location. The default is keyed by the device id,
+    // which is derived from the IP address, so an address change silently
+    // started from empty state (channel names and subscriptions lost).
+    let dir = match &self_info.state_dir {
+      Some(dir) => dir.to_string_lossy().into_owned(),
+      None => {
+        AppDirs::new(Some("inferno_aoip"), false).unwrap().state_dir.to_str().unwrap().to_owned()
+          + MAIN_SEPARATOR_STR
+          + &hex::encode(self_info.factory_device_id)
+      }
+    };
     create_dir_all(&dir).log_and_forget();
     info!("using state directory: {dir}");
     Self { path_prefix: dir + MAIN_SEPARATOR_STR }
