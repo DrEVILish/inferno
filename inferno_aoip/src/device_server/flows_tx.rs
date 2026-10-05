@@ -996,6 +996,7 @@ mod restart_tests {
       cmc_port: 0,
       flows_control_port: 0,
       info_request_port: 0,
+      product_version: None,
     }
   }
 
