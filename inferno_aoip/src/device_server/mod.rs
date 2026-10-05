@@ -95,6 +95,70 @@ pub struct TransferNotifier {
   pub max_interval_samples: Clock,
 }
 
+/// Rate limit for TransferNotifier callbacks from the realtime loops.
+///
+/// The RX and TX loops used to notify on every iteration, i.e. every packet
+/// (thousands per second with a few flows). Each callback wakes the
+/// application's blocked ALSA read or write, which finds less than a period
+/// available and sleeps again: at 2 channels that churn was most of an idle
+/// recorder's CPU. A quarter of max_interval_samples (the ALSA period)
+/// between notifications still wakes the application well before each
+/// period is complete.
+pub(crate) struct NotifyThrottle {
+  interval: Duration,
+  next: Instant,
+}
+
+impl NotifyThrottle {
+  pub(crate) fn new(max_interval_samples: Clock, sample_rate: u32) -> Self {
+    let interval =
+      Duration::from_nanos(max_interval_samples as u64 * 1_000_000_000 / 4 / (sample_rate.max(1) as u64));
+    Self { interval, next: Instant::now() }
+  }
+
+  /// Whether a notification is due at `now`; if so, the next one is due an
+  /// interval later.
+  pub(crate) fn due(&mut self, now: Instant) -> bool {
+    if now < self.next {
+      return false;
+    }
+    self.next = now + self.interval;
+    true
+  }
+}
+
+#[cfg(test)]
+mod notify_throttle_tests {
+  use super::*;
+
+  #[test]
+  fn spaces_notifications_by_a_quarter_period() {
+    let mut t = NotifyThrottle::new(1024, 48000); // 21.3ms period -> 5.33ms
+    let t0 = Instant::now();
+    t.next = t0;
+    assert!(t.due(t0), "first call notifies");
+    assert!(!t.due(t0 + Duration::from_millis(1)));
+    assert!(!t.due(t0 + Duration::from_millis(5)));
+    assert!(t.due(t0 + Duration::from_micros(5334)));
+    // Spacing restarts from the notification, not from a fixed grid, so
+    // a late loop iteration never produces a burst.
+    assert!(t.due(t0 + Duration::from_millis(50)));
+    assert!(!t.due(t0 + Duration::from_millis(51)));
+    assert!(t.due(t0 + Duration::from_micros(55334)));
+  }
+
+  #[test]
+  fn bounds_the_rate_of_a_per_packet_loop() {
+    // 3000 iterations a second for one second notify under 190 times (the
+    // quarter period rounds up to whole iterations), not 3000.
+    let mut t = NotifyThrottle::new(1024, 48000);
+    let t0 = Instant::now();
+    t.next = t0;
+    let n = (0..3000).filter(|i| t.due(t0 + Duration::from_micros(i * 333))).count();
+    assert!((170..=190).contains(&n), "{n} notifications");
+  }
+}
+
 pub struct DeviceServer {
   pub self_info: Arc<DeviceInfo>,
   ref_instant: Instant,

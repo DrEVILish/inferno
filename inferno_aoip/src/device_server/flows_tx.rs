@@ -3,7 +3,12 @@ use std::num::Wrapping;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
-use std::{collections::BTreeMap, net::SocketAddr, sync::atomic::AtomicU32, time::Duration};
+use std::{
+  collections::BTreeMap,
+  net::SocketAddr,
+  sync::atomic::AtomicU32,
+  time::{Duration, Instant},
+};
 
 use atomic::Ordering;
 use futures::FutureExt;
@@ -15,7 +20,7 @@ use tokio::{select, sync::mpsc};
 
 use super::samples_utils::*;
 use super::tx_multicasts::MEDIA_PORT;
-use crate::device_server::TransferNotifier;
+use crate::device_server::{NotifyThrottle, TransferNotifier};
 use crate::media_clock::async_clock_receiver_to_realtime;
 use crate::ring_buffer::{ProxyToSamplesBuffer, RBOutput};
 use crate::util::os::set_current_thread_realtime;
@@ -269,6 +274,8 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
       }
     };
     let mut next_on_transfer = now as Clock;
+    let mut notify =
+      self.on_transfer.as_ref().map(|t| NotifyThrottle::new(t.max_interval_samples, sample_rate as u32));
     let mut next_process_events = now as Clock;
     drop(now);
 
@@ -314,7 +321,13 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
         self
           .current_timestamp
           .store(cur_ts_opt.unwrap_or(usize::MAX), Ordering::SeqCst /*TODO: really needed?*/);
-        self.on_transfer.as_ref().map(|transfer| (transfer.callback)());
+        // Rate limited: this branch runs once per packet. (The branch below
+        // precedes a long wait, so it always notifies.)
+        if let Some(transfer) = self.on_transfer.as_ref() {
+          if notify.as_mut().is_some_and(|n| n.due(Instant::now())) {
+            (transfer.callback)();
+          }
+        }
 
         if !sleep_duration.is_zero() {
           std::thread::sleep(sleep_duration);

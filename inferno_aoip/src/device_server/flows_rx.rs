@@ -1,6 +1,6 @@
 use super::samples_utils::*;
 use crate::device_info::DeviceInfo;
-use crate::device_server::TransferNotifier;
+use crate::device_server::{NotifyThrottle, TransferNotifier};
 use crate::net_utils::MTU;
 use crate::ring_buffer::{ProxyToSamplesBuffer, RBInput, RingBufferShared};
 use crate::util::os::set_current_thread_realtime;
@@ -261,6 +261,8 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
     // Received samples are written only once the start time is known: ring
     // buffer positions count from it (ALSA starts counting from 0).
     let mut awaiting_start = start_time_rx.is_some();
+    let mut notify =
+      self.on_transfer.as_ref().map(|t| NotifyThrottle::new(t.max_interval_samples, self.sample_rate));
 
     set_current_thread_realtime(80);
     loop {
@@ -329,9 +331,11 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
           }
         }
       }
-      //if start_time_rx.is_none() {
-      self.on_transfer.as_ref().map(|transfer| (transfer.callback)());
-      //} XXX
+      if let Some(transfer) = self.on_transfer.as_ref() {
+        if notify.as_mut().is_some_and(|n| n.due(Instant::now())) {
+          (transfer.callback)();
+        }
+      }
 
       if may_have_command {
         match self.commands_receiver.try_recv() {
