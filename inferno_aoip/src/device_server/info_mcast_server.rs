@@ -22,6 +22,11 @@ use tokio::{
 };
 
 const SEND_BUFFER_SIZE: usize = 1500;
+
+/// Board info capability word: manufacturer name, sample rate and encoding
+/// configuration (see send_board_info). The rate and encoding lists hold
+/// only the running values, so a controller can show but not change them.
+const BOARD_PRIMARY_CAPABILITIES: u32 = 0x0000_1000 | 0x0000_0008 | 0x0000_0010;
 const DST_PORT_HEARTBEAT: u16 = 8708;
 const DST_PORT_DEVICE_INFO: u16 = 8702;
 
@@ -143,10 +148,15 @@ impl<'s> Multicaster<'s> {
     //       0x10 - has Manufacturer name
     //       0x40 - Network is configurable (supports static addressing)
     // 0x17: Identify device, Sample rate & encoding configuration, Reboot, Factory reset (was 0xdb)
-    content[0x14] = 0;
-    content[0x15] = 0;
-    content[0x16] = 0x10;
-    content[0x17] = 0;
+    // As one big-endian u32 at 0x14 (netaudio's "primary capabilities";
+    // bit meanings checked against its parser):
+    //   0x0000_0001 identify, 0x0000_0008 sample rate configuration,
+    //   0x0000_0010 encoding configuration, 0x0000_1000 manufacturer name,
+    //   0x0000_4000 static IPv4, 0x0400_0000 AES67, 0x0800_0000 locking.
+    // Without the sample rate / encoding bits a controller's device config
+    // leaves both blank ("does not support sample rate configuration") even
+    // though the 0x81/0x83 probes are answered.
+    content[0x14..0x18].copy_from_slice(&BOARD_PRIMARY_CAPABILITIES.to_be_bytes());
 
     content[0xbb] = 0x1f; // if 0, device is flooded with info multicast requests around 1 per second
                           /* content[0xbf] = 5;
@@ -599,7 +609,14 @@ fn capability_status_content(current: u32, update_mode: u16, supported: &[u32]) 
 
 #[cfg(test)]
 mod capability_tests {
-  use super::capability_status_content;
+  use super::{capability_status_content, BOARD_PRIMARY_CAPABILITIES};
+
+  #[test]
+  fn board_info_advertises_rate_and_encoding_configuration() {
+    // bytes 0x14..0x18 of the board info: manufacturer name (0x10 in
+    // byte 0x16), sample rate (0x08) and encoding (0x10) in byte 0x17
+    assert_eq!(BOARD_PRIMARY_CAPABILITIES.to_be_bytes(), [0x00, 0x00, 0x10, 0x18]);
+  }
 
   #[test]
   fn sample_rate_status_layout() {
