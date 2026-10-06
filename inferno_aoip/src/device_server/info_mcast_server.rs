@@ -380,6 +380,9 @@ impl<'s> Multicaster<'s> {
 /// a fixed header, then one 16-byte record per PTP port, then the clock
 /// identities as EUI-64. Captured from a hardware interface leading the LAN
 /// (PTPv1), with the per-device fields zeroed; send_clock_stats fills them:
+///   0x00        clock sync state: 1 = PLL not locked (upstream's note),
+///               2 = grand leader (what the captured leader sends),
+///               3 = locked follower (upstream inferno's value)
 ///   0x02, 0x28  port state (PTP portState: 6 = master, 9 = slave)
 ///   0x04        status flags
 ///   0x08        frequency offset, ppb (i32)
@@ -411,7 +414,13 @@ const CLOCK_STATUS_TEMPLATE: [u8; 188] = [
 /// CLOCK_STATUS_TEMPLATE.
 fn build_clock_status(own_mac: [u8; 6], leader: &[u8; 8], freq_offset_ppb: i32) -> Vec<u8> {
   const SLAVE: u16 = 9;
+  // A clock status is only sent once the media clock follows the leader
+  // (get_freq_offset_ppb is Some), so this device is a locked follower.
+  // The template's leader value (2) paired with a follower's port state
+  // made controllers show the sync status as an error.
+  const LOCKED_FOLLOWER: u16 = 3;
   let mut c = CLOCK_STATUS_TEMPLATE.to_vec();
+  c[0x00..0x02].copy_from_slice(&LOCKED_FOLLOWER.to_be_bytes());
   let eui64 = |id: &[u8]| [id[0], id[1], id[2], 0xff, 0xfe, id[3], id[4], id[5]];
   c[0x02..0x04].copy_from_slice(&SLAVE.to_be_bytes());
   c[0x28..0x2a].copy_from_slice(&SLAVE.to_be_bytes());
@@ -528,6 +537,7 @@ mod clock_stats_tests {
     let leader = [0x00, 0x1d, 0xc1, 0x52, 0x17, 0xc7, 0, 0];
     let c = build_clock_status(own, &leader, -13204);
     assert_eq!(c.len(), 188);
+    assert_eq!(&c[0x00..0x02], &[0, 3], "sync state: locked follower, not the leader's 2");
     assert_eq!(&c[0x02..0x04], &[0, 9], "header port state: slave");
     assert_eq!(&c[0x28..0x2a], &[0, 9], "port state: slave");
     assert_eq!(&c[0x6c..0x6e], &[0, 9], "PTPv1 multicast port record: slave");
