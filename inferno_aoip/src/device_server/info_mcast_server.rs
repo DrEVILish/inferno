@@ -127,6 +127,20 @@ impl<'s> Multicaster<'s> {
       .await;
   }
 
+  /// Sample rate status (0x80): the running rate is the only one listed.
+  async fn send_sample_rate_status(&mut self) {
+    let rate = self.self_info.sample_rate;
+    self.send_capability_status(0x80, rate, SAMPLE_RATE_UPDATE_MODE, &[rate]).await;
+  }
+
+  /// Encoding status (0x82). Only the running encoding is listed: a set
+  /// request (operation mode 1) is answered with this same status, so
+  /// offering 16/32 would show choices that do nothing.
+  async fn send_encoding_status(&mut self) {
+    let enc = self.self_info.bits_per_sample as u32;
+    self.send_capability_status(0x82, enc, ENCODING_UPDATE_MODE, &[enc]).await;
+  }
+
   async fn send_board_info(&mut self) {
     let mut content = [0u8; 200];
     // Firmware version:
@@ -477,6 +491,12 @@ pub async fn run_server(
   let mut mcaster = Multicaster::new(self_info.as_ref(), server, clock, get_peaks);
   mcaster.send_board_info().await;
   mcaster.send_product_info().await;
+  // Announce the sample rate and encoding unprompted, as a hardware device
+  // does when they change: the host changes the rate by restarting the
+  // device, and a controller that is already open otherwise keeps showing
+  // the old rate until it happens to probe again.
+  mcaster.send_sample_rate_status().await;
+  mcaster.send_encoding_status().await;
   let mut heartbeat_interval = interval(Duration::from_secs(1));
   heartbeat_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
   while mcaster.should_work() {
@@ -506,16 +526,11 @@ pub async fn run_server(
           }
           [0x07, _, 0, 0x81, 0, 0, 0, _] => {
             // sample-rate probe (netaudio probe_sample_rate) -> status 0x80
-            let rate = mcaster.self_info.sample_rate;
-            mcaster.send_capability_status(0x80, rate, SAMPLE_RATE_UPDATE_MODE, &[rate]).await;
+            mcaster.send_sample_rate_status().await;
           }
           [0x07, _, 0, 0x83, 0, 0, 0, _] => {
-            // encoding probe -> status 0x82. Only the running encoding is
-            // listed: a set request (operation mode 1) is answered with this
-            // same status, so offering 16/32 would show choices that do
-            // nothing.
-            let enc = mcaster.self_info.bits_per_sample as u32;
-            mcaster.send_capability_status(0x82, enc, ENCODING_UPDATE_MODE, &[enc]).await;
+            // encoding probe -> status 0x82
+            mcaster.send_encoding_status().await;
           }
           [0x07, _, 0, 0x77, 0, 0, 0, _]=> {
             mcaster.send(
