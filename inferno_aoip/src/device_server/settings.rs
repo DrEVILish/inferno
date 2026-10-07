@@ -144,7 +144,10 @@ fn create_self_info(
     state_dir: settings.get("STATE_DIR").map(Into::into),
   };
 
-  if let Some(altport) = settings.get("ALT_PORT").map(|s| s.parse().expect("ALT_PORT must be u16")) {
+  if let Some(altport) = settings.get("ALT_PORT").map(|s| s.parse::<u16>().expect("ALT_PORT must be u16")) {
+    // The three following ports are used too: 65533..=65535 used to
+    // overflow (a panic in debug builds, a wrap to ports 0.. in release).
+    assert!(altport <= u16::MAX - 3, "ALT_PORT must be at most {}", u16::MAX - 3);
     result.arc_port = altport;
     result.cmc_port = altport + 1;
     result.flows_control_port = altport + 2;
