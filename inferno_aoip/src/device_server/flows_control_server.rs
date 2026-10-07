@@ -54,6 +54,14 @@ pub async fn run_server(
             conn.respond_with_code(FlowControlError::SampleRateMismatch as u16, &[]).await;
             continue;
           }
+          // The flow's sample width comes from the network: 20 bits used to
+          // become 2 bytes (16-bit samples) and 33 bits 4, silently
+          // sending a format the receiver never asked for.
+          if !matches!(bits_per_sample, 16 | 24 | 32) {
+            error!("unsupported bit depth {bits_per_sample}, returning error");
+            conn.respond_with_code(0x0302u16 /* TODO */, &[]).await;
+            continue;
+          }
           if fpp > FPP_MAX {
             error!("too large fpp, returning error");
             conn.respond_with_code(0x0302u16 /* TODO */, &[]).await;
