@@ -212,6 +212,10 @@ pub struct Settings {
   pub clock_path: Option<PathBuf>,
   pub use_safe_clock: bool,
   pub tx_source_bit_depth: u8,
+  /// FIXED_LAST_CHANNEL_NAME: the last RX and the last TX channel carry this
+  /// name and cannot be renamed (an application's dedicated channel, e.g. a
+  /// timecode channel). None leaves every channel renamable.
+  pub fixed_last_channel_name: Option<String>,
 }
 
 impl Settings {
@@ -256,6 +260,16 @@ impl Settings {
       clock_path: config.get("CLOCK_PATH").map(|p| p.try_into().unwrap()),
       use_safe_clock,
       tx_source_bit_depth,
+      fixed_last_channel_name: config
+        .get("FIXED_LAST_CHANNEL_NAME")
+        .filter(|n| {
+          let ok = super::saved_settings::is_valid_channel_name(n);
+          if !ok {
+            log::warn!("ignoring FIXED_LAST_CHANNEL_NAME {n:?}: not a valid channel name");
+          }
+          ok
+        })
+        .cloned(),
     };
 
     // the following should be harmless, as the application still has the chance to overwrite it
@@ -269,26 +283,41 @@ impl Settings {
     result
   }
   pub fn make_rx_channels(&mut self, count: usize) {
-    self.self_info.rx_channels = (1..=count)
-      .map(|id| Channel {
-        factory_name: format!("{id:02}"),
-        friendly_name: Arc::new(RwLock::new(format!("RX {id}"))),
-      })
-      .collect();
+    self.self_info.rx_channels = make_channels("RX", count, self.fixed_last_channel_name.as_deref());
   }
   pub fn make_tx_channels(&mut self, count: usize) {
-    self.self_info.tx_channels = (1..=count)
-      .map(|id| Channel {
-        factory_name: format!("{id:02}"),
-        friendly_name: Arc::new(RwLock::new(format!("TX {id}"))),
-      })
-      .collect();
+    self.self_info.tx_channels = make_channels("TX", count, self.fixed_last_channel_name.as_deref());
   }
+}
+
+/// Channels 1..=count named "<prefix> <n>"; with fixed_last, the last one is
+/// named that instead and marked fixed.
+fn make_channels(prefix: &str, count: usize, fixed_last: Option<&str>) -> Vec<Channel> {
+  (1..=count)
+    .map(|id| {
+      let fixed = fixed_last.filter(|_| id == count);
+      Channel {
+        factory_name: format!("{id:02}"),
+        friendly_name: Arc::new(RwLock::new(fixed.map_or_else(|| format!("{prefix} {id}"), str::to_owned))),
+        fixed_name: fixed.is_some(),
+      }
+    })
+    .collect()
 }
 
 #[cfg(test)]
 mod tests {
-  use super::truncate_utf8;
+  use super::{make_channels, truncate_utf8};
+
+  #[test]
+  fn fixed_last_channel_name() {
+    let chans = make_channels("RX", 3, Some("TIMECODE"));
+    let names: Vec<String> = chans.iter().map(|c| c.friendly_name.read().unwrap().clone()).collect();
+    assert_eq!(names, ["RX 1", "RX 2", "TIMECODE"]);
+    assert_eq!(chans.iter().map(|c| c.fixed_name).collect::<Vec<_>>(), [false, false, true]);
+    assert!(make_channels("TX", 2, None).iter().all(|c| !c.fixed_name));
+    assert!(make_channels("TX", 0, Some("TIMECODE")).is_empty());
+  }
 
   #[test]
   fn truncate_utf8_never_splits_a_character() {

@@ -9,6 +9,9 @@ use netdev::mac::MacAddr;
 pub struct Channel {
   pub factory_name: String,
   pub friendly_name: Arc<RwLock<String>>, // Arc is needed only because of Clone requirement, TODO: fix the ALSA plugin
+  /// The name is set by the application (FIXED_LAST_CHANNEL_NAME): rename
+  /// requests and saved names never change it.
+  pub fixed_name: bool,
 }
 
 pub type DeviceId = [u8; 8];

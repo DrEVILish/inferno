@@ -244,7 +244,10 @@ pub async fn run_server(
               }
               Ok(new_name) => {
                 let index = (channel_id - 1) as usize;
-                if index < self_info.tx_channels.len() {
+                if self_info.tx_channels.get(index).is_some_and(|c| c.fixed_name) {
+                  error!("refusing to rename TX channel id {channel_id}: its name is fixed");
+                  None
+                } else if index < self_info.tx_channels.len() {
                   info!("renaming TX channel id {channel_id} to {new_name}");
                   mdns_server.remove_tx_channel(index);
                   saved_channels.rename_tx_channel(index, new_name.to_owned());
@@ -290,7 +293,10 @@ pub async fn run_server(
               }
               Ok(new_name) => {
                 let index = (channel_id - 1) as usize;
-                if index < self_info.rx_channels.len() {
+                if self_info.rx_channels.get(index).is_some_and(|c| c.fixed_name) {
+                  error!("refusing to rename RX channel id {channel_id}: its name is fixed");
+                  None
+                } else if index < self_info.rx_channels.len() {
                   info!("renaming RX channel id {channel_id} to {new_name}");
                   saved_channels.rename_rx_channel(index, new_name.to_owned());
                   renamed_any = true;
