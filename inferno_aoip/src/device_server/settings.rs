@@ -60,15 +60,15 @@ fn create_self_info(
   // TODO make hostname and sample rate configurable from DC
   let friendly_hostname = settings
     .get("NAME")
-    .map(|s| if s.len() > 31 { s[0..31].to_owned() } else { s.clone() })
+    .map(|s| truncate_utf8(s, 31).to_owned())
     .unwrap_or_else(|| {
       format!(
         "{} {}",
-        if app_name.len() > 22 { &app_name[0..22] } else { &app_name },
+        truncate_utf8(app_name, 22),
         hex::encode(&my_ipv4.octets())
       )
     });
-  let short_app_name = if short_app_name.len() > 14 { &short_app_name[0..14] } else { short_app_name };
+  let short_app_name = truncate_utf8(short_app_name, 14);
 
   let sample_rate = settings
     .get("SAMPLE_RATE")
@@ -152,6 +152,20 @@ fn create_self_info(
   }
 
   result
+}
+
+/// The longest prefix of `s` that is at most `max` bytes and ends on a
+/// character boundary. Slicing `&s[0..max]` panicked when byte `max` fell
+/// inside a multi-byte character (a non-ASCII NAME, say).
+fn truncate_utf8(s: &str, max: usize) -> &str {
+  if s.len() <= max {
+    return s;
+  }
+  let mut end = max;
+  while !s.is_char_boundary(end) {
+    end -= 1;
+  }
+  &s[..end]
 }
 
 /// "major.minor.patch" (patch optional) as announced product version
@@ -266,5 +280,22 @@ impl Settings {
         friendly_name: Arc::new(RwLock::new(format!("TX {id}"))),
       })
       .collect();
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::truncate_utf8;
+
+  #[test]
+  fn truncate_utf8_never_splits_a_character() {
+    assert_eq!(truncate_utf8("short", 31), "short");
+    assert_eq!(truncate_utf8("abcdef", 3), "abc");
+    // 'é' is two bytes: byte 3 falls inside the second one
+    assert_eq!(truncate_utf8("aééb", 4), "aé");
+    assert_eq!(truncate_utf8("aééb", 5), "aéé");
+    let name = "Ünïcödé recorder name that is long";
+    let cut = truncate_utf8(name, 31);
+    assert!(cut.len() <= 31 && name.starts_with(cut));
   }
 }
