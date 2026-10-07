@@ -998,6 +998,8 @@ mod restart_tests {
       info_request_port: 0,
       product_version: None,
       name_request_path: None,
+      latency_request_path: None,
+      announced_latency_ns: Default::default(),
       state_dir: None,
     }
   }

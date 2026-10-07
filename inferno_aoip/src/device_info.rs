@@ -54,6 +54,15 @@ pub struct DeviceInfo {
   /// (NAME_REQUEST_PATH); None = renaming from a controller is unsupported.
   pub name_request_path: Option<std::path::PathBuf>,
 
+  /// Where a controller's receive-latency change is handed to the host
+  /// (LATENCY_REQUEST_PATH, the latency in ns on one line); None = the
+  /// latency cannot be changed from a controller.
+  pub latency_request_path: Option<std::path::PathBuf>,
+
+  /// The receive latency controllers are told (ns): latency_ns, or what a
+  /// controller last asked for while the host applies it.
+  pub announced_latency_ns: Arc<std::sync::atomic::AtomicU32>,
+
   /// Where saved state (channel names, subscriptions) lives (STATE_DIR);
   /// None = the per-user state dir plus a per-device-id subdirectory.
   pub state_dir: Option<std::path::PathBuf>,
@@ -97,6 +106,8 @@ mod tests {
       info_request_port: 0,
       product_version: None,
       name_request_path: None,
+      latency_request_path: None,
+      announced_latency_ns: Default::default(),
       state_dir: None,
     }
   }
