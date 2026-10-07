@@ -61,6 +61,9 @@ impl SavedChannelsSettings {
         error!("corrupted saved channels: id {}", cs.id);
         continue;
       }
+      if dst[index].fixed_name {
+        continue;
+      }
       if !is_valid_channel_name(&cs.friendly_name) {
         error!("ignoring invalid saved name for channel id {}: {:?}", cs.id, cs.friendly_name);
         continue;
@@ -94,6 +97,24 @@ impl SavedChannelsSettings {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn saved_names_never_replace_a_fixed_name() {
+    use std::sync::RwLock;
+    let chan = |name: &str, fixed| device_info::Channel {
+      factory_name: String::new(),
+      friendly_name: Arc::new(RwLock::new(name.to_owned())),
+      fixed_name: fixed,
+    };
+    let dst = vec![chan("RX 1", false), chan("TIMECODE", true)];
+    let mut src = vec![
+      ChannelSettings { id: 1, friendly_name: "Kick".into() },
+      ChannelSettings { id: 2, friendly_name: "Snare".into() },
+    ];
+    SavedChannelsSettings::load_and_init(&mut src, &dst);
+    assert_eq!(*dst[0].friendly_name.read().unwrap(), "Kick");
+    assert_eq!(*dst[1].friendly_name.read().unwrap(), "TIMECODE");
+  }
 
   #[test]
   fn channel_names() {
