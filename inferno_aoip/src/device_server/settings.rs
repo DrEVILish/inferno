@@ -141,6 +141,8 @@ fn create_self_info(
     info_request_port: INFO_REQUEST_PORT,
     product_version: settings.get("PRODUCT_VERSION").and_then(|v| parse_product_version(v)),
     name_request_path: settings.get("NAME_REQUEST_PATH").map(Into::into),
+    latency_request_path: settings.get("LATENCY_REQUEST_PATH").map(Into::into),
+    announced_latency_ns: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(latency_ns.try_into().unwrap_or(u32::MAX))),
     state_dir: settings.get("STATE_DIR").map(Into::into),
   };
 

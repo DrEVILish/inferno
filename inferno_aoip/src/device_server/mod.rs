@@ -372,7 +372,9 @@ impl DeviceServer {
       self.mdns_client.clone(),
       self.mcast_tx.clone(),
       channels_buffering,
-      self.tx_latency_ns, /* FIXME should be RX latency */
+      // The receiver's own minimum latency is RX_LATENCY_NS (it used the
+      // transmit latency, so RX_LATENCY_NS was announced but never used).
+      self.self_info.latency_ns.try_into().unwrap_or(u32::MAX),
       self.state_storage.clone(),
       srx2,
       self.ref_instant,

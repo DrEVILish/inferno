@@ -676,6 +676,41 @@ pub async fn run_server(
           // has, values from its settings (see device_settings_response).
           conn.respond_with_code(1, &device_settings_response(&self_info)).await;
         }
+        0x1101 => {
+          // Device settings write: a controller sets the receive latency.
+          // The host owns the setting (it persists it and restarts the
+          // device with the new RX_LATENCY_NS), so the request is handed
+          // over through LATENCY_REQUEST_PATH. Reads report the new value
+          // at once, so a controller's verify-after-write sees it.
+          let code = match (&self_info.latency_request_path, requested_latency_ns(request.content())) {
+            (None, _) => 0x30,
+            (_, None) => {
+              warn!("settings write without a latency: {}", hex::encode(request.content()));
+              0x30
+            }
+            (Some(_), Some(ns)) if !(MIN_LATENCY_NS..=MAX_LATENCY_NS).contains(&ns) => {
+              warn!("refusing receive latency {ns} ns: outside {MIN_LATENCY_NS}..={MAX_LATENCY_NS}");
+              0x30
+            }
+            (Some(path), Some(ns)) => match write_latency_request(path, ns) {
+              Ok(()) => {
+                info!("receive latency {ns} ns requested by a controller");
+                self_info.announced_latency_ns.store(ns, std::sync::atomic::Ordering::Relaxed);
+                1
+              }
+              Err(e) => {
+                error!("cannot hand latency request to the host ({}): {e}", path.display());
+                0x30
+              }
+            },
+          };
+          if code == 1 {
+            conn.respond_with_code(1, &device_settings_response(&self_info)).await;
+            mcast.send(make_latency_change_notification()).await.log_and_forget();
+          } else {
+            conn.respond_with_code(code, &[]).await;
+          }
+        }
         0x1102 => {
           // Property directory: which settings exist and how they may be
           // used (was 94 zero bytes).
@@ -785,18 +820,53 @@ pub async fn run_server(
   }
 }
 
-/// Latency limits announced to controllers. The device runs at its
-/// configured RX latency; changing it from a controller is not supported.
-const MIN_LATENCY_NS: u32 = 1_000_000;
-const MAX_LATENCY_NS: u32 = 40_000_000;
+/// Latency limits announced to controllers: the receive latency can be set
+/// within them (0x1101, handed to the host through LATENCY_REQUEST_PATH).
+const MIN_LATENCY_NS: u32 = 500_000;
+const MAX_LATENCY_NS: u32 = 10_000_000;
 const DEFAULT_LATENCY_NS: u32 = 10_000_000;
+
+/// The latency a 0x1101 settings write asks for: the value of its
+/// configured (0x8205) or active (0x8301) latency record. Records are
+/// (property id, value offset from the start of the packet), behind a
+/// one-byte kind and a one-byte count, like the 0x1100 reply.
+fn requested_latency_ns(content: &[u8]) -> Option<u32> {
+  const HEADER: usize = 10;
+  let count = *content.get(1)? as usize;
+  for rec in content.get(2..2 + count * 4)?.chunks(4) {
+    let id = u16::from_be_bytes([rec[0], rec[1]]);
+    if id != 0x8205 && id != 0x8301 {
+      continue;
+    }
+    let off = (u16::from_be_bytes([rec[2], rec[3]]) as usize).checked_sub(HEADER)?;
+    let v = content.get(off..off + 4)?;
+    return Some(u32::from_be_bytes(v.try_into().ok()?));
+  }
+  None
+}
+
+/// Writes a latency request for the host atomically (temp file + rename).
+fn write_latency_request(path: &std::path::Path, ns: u32) -> std::io::Result<()> {
+  let tmp = path.with_extension("tmp");
+  std::fs::write(&tmp, format!("{ns}\n"))?;
+  std::fs::rename(&tmp, path)
+}
+
+/// The notification controllers wait for after a latency change.
+fn make_latency_change_notification() -> crate::protocol::mcast::MulticastMessage {
+  crate::protocol::mcast::MulticastMessage {
+    start_code: 0xffff,
+    opcode: [0x07, 0x2a, 0x01, 0x06, 0, 0, 0, 0],
+    content: vec![0, 0],
+  }
+}
 
 /// The 0x1100 device settings reply: a record per property (id, offset of
 /// its value from the start of the packet), then the u32 values:
 /// sample rate (0x8020), and default/configured/active/maximum/minimum
 /// latency in ns (0x8204/0x8205/0x8301/0x8302/0x8306).
 fn device_settings_response(self_info: &DeviceInfo) -> Vec<u8> {
-  let latency: u32 = self_info.latency_ns.try_into().unwrap_or(u32::MAX);
+  let latency: u32 = self_info.announced_latency_ns.load(std::sync::atomic::Ordering::Relaxed);
   let settings: [(u16, u32); 6] = [
     (0x8020, self_info.sample_rate),
     (0x8204, DEFAULT_LATENCY_NS),
@@ -846,6 +916,7 @@ mod device_settings_tests {
     let mut info = crate::device_server::settings::Settings::new("t", "t", Some(std::net::Ipv4Addr::LOCALHOST), &Default::default()).self_info;
     info.sample_rate = 48000;
     info.latency_ns = 10_000_000;
+    info.announced_latency_ns.store(10_000_000, std::sync::atomic::Ordering::Relaxed);
     let body = device_settings_response(&info);
     assert_eq!(&body[..2], &[0x02, 6]);
     // Each record's value offset counts the 10-byte ARC header.
@@ -859,6 +930,21 @@ mod device_settings_tests {
     assert_eq!(value(0x8205), 10_000_000);
     assert_eq!(value(0x8306), MIN_LATENCY_NS);
     assert_eq!(value(0x8302), MAX_LATENCY_NS);
+  }
+
+  #[test]
+  fn latency_write_requests() {
+    // As netaudio sends it: 2 ms in the configured and active records.
+    let content = hex::decode("05048205002002110004830100240310000483028306001e8480001e8480").unwrap();
+    assert_eq!(requested_latency_ns(&content), Some(2_000_000));
+    assert_eq!(requested_latency_ns(&[0x05, 0x01, 0x80, 0x20, 0x00, 0x10, 0, 0, 0, 0]), None);
+    assert_eq!(requested_latency_ns(&[0x05, 0x04, 0x82]), None);
+    let dir = std::env::temp_dir().join(format!("latreq-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("req");
+    write_latency_request(&path, 500_000).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "500000\n");
+    std::fs::remove_dir_all(&dir).unwrap();
   }
 
   #[test]
