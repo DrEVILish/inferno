@@ -58,7 +58,16 @@ pub enum RequestParseError {
   BadOffset { field: &'static str, offset: usize },
   #[error("{field} is not valid UTF-8")]
   BadString { field: &'static str },
+  #[error("{field} is {len} bytes, longer than {MAX_REQUEST_NAME_LEN}")]
+  StringTooLong { field: &'static str, len: usize },
 }
+
+/// Longest receiver host or flow name a flow request may carry. Device and
+/// flow names on the network are at most 31 characters; this leaves room
+/// for multi-byte UTF-8. The names are stored with the flow and echoed back
+/// in ARC transmit-flow pages, so an unbounded one (up to a whole datagram)
+/// made a page larger than the send buffer.
+pub const MAX_REQUEST_NAME_LEN: usize = 63;
 
 /// A request flow (opcode 0x0100) as received by a transmitter.
 #[derive(Debug, PartialEq, Eq)]
@@ -92,8 +101,12 @@ fn string_at<'a>(
   if offset >= packet.len() {
     return Err(RequestParseError::BadOffset { field, offset });
   }
-  crate::byte_utils::read_0term_str_from_buffer(packet, offset)
-    .map_err(|_| RequestParseError::BadString { field })
+  let s = crate::byte_utils::read_0term_str_from_buffer(packet, offset)
+    .map_err(|_| RequestParseError::BadString { field })?;
+  if s.len() > MAX_REQUEST_NAME_LEN {
+    return Err(RequestParseError::StringTooLong { field, len: s.len() });
+  }
+  Ok(s)
 }
 
 /// Parses a request flow packet (whole packet, header included: string and
@@ -452,6 +465,26 @@ mod tests {
       packet.truncate(rng.gen_range(0..=packet.len()));
       let _ = parse_flow_request(&packet);
     }
+  }
+
+  #[test]
+  fn parse_flow_request_rejects_overlong_names() {
+    let mut info = minimal_device_info();
+    info.ip_address = Ipv4Addr::new(192, 168, 1, 7);
+    for (host, flow) in [("h".repeat(64), "1_42".to_owned()), ("rx-host".to_owned(), "f".repeat(64))] {
+      info.friendly_hostname = host;
+      let client = FlowsControlClient::new(Arc::new(info.clone()));
+      let body = client.flow_request_body(48000, 24, 32, &[Some(1)], 5004, &flow);
+      let mut buf = [0u8; MTU];
+      let packet = make_packet(&mut buf, 0x1102, 1, 0x0100, 0, &body).to_vec();
+      assert!(matches!(parse_flow_request(&packet), Err(RequestParseError::StringTooLong { len: 64, .. })));
+    }
+    info.friendly_hostname = "h".repeat(MAX_REQUEST_NAME_LEN);
+    let client = FlowsControlClient::new(Arc::new(info));
+    let body = client.flow_request_body(48000, 24, 32, &[Some(1)], 5004, "1_42");
+    let mut buf = [0u8; MTU];
+    let packet = make_packet(&mut buf, 0x1102, 1, 0x0100, 0, &body).to_vec();
+    assert_eq!(parse_flow_request(&packet).unwrap().rx_hostname.len(), MAX_REQUEST_NAME_LEN);
   }
 
   #[test]
