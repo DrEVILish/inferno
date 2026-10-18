@@ -677,36 +677,64 @@ pub async fn run_server(
           conn.respond_with_code(1, &device_settings_response(&self_info)).await;
         }
         0x1101 => {
-          // Device settings write: a controller sets the receive latency.
-          // The host owns the setting (it persists it and restarts the
-          // device with the new RX_LATENCY_NS), so the request is handed
-          // over through LATENCY_REQUEST_PATH. Reads report the new value
-          // at once, so a controller's verify-after-write sees it.
-          let code = match (&self_info.latency_request_path, requested_latency_ns(request.content())) {
-            (None, _) => 0x30,
-            (_, None) => {
-              warn!("settings write without a latency: {}", hex::encode(request.content()));
-              0x30
-            }
-            (Some(_), Some(ns)) if !(MIN_LATENCY_NS..=MAX_LATENCY_NS).contains(&ns) => {
-              warn!("refusing receive latency {ns} ns: outside {MIN_LATENCY_NS}..={MAX_LATENCY_NS}");
-              0x30
-            }
-            (Some(path), Some(ns)) => match write_latency_request(path, ns) {
-              Ok(()) => {
-                info!("receive latency {ns} ns requested by a controller");
-                self_info.announced_latency_ns.store(ns, std::sync::atomic::Ordering::Relaxed);
-                1
+          // Device settings write: a controller sets the receive latency and/or
+          // the sample rate. The host owns these settings, so requests are
+          // handed over through the *_REQUEST_PATH files. Reads report the new
+          // value at once, so a controller's verify-after-write sees it.
+          let content = request.content();
+          let lat = requested_latency_ns(content);
+          let sr = requested_sample_rate(content);
+
+          let mut code = 1u16;
+          let mut wrote_latency = false;
+          let mut wrote_sr = false;
+
+          if let Some(ns) = lat {
+            match &self_info.latency_request_path {
+              None => { code = 0x30; warn!("latency write unsupported (no LATENCY_REQUEST_PATH)"); }
+              Some(path) if !(MIN_LATENCY_NS..=MAX_LATENCY_NS).contains(&ns) => {
+                code = 0x30; warn!("refusing receive latency {ns} ns");
               }
-              Err(e) => {
-                error!("cannot hand latency request to the host ({}): {e}", path.display());
-                0x30
-              }
-            },
-          };
+              Some(path) => match write_latency_request(path, ns) {
+                Ok(()) => {
+                  info!("receive latency {ns} ns requested by a controller");
+                  self_info.announced_latency_ns.store(ns, std::sync::atomic::Ordering::Relaxed);
+                  wrote_latency = true;
+                }
+                Err(e) => { code = 0x30; error!("cannot hand latency request: {e}"); }
+              },
+            }
+          }
+
+          if code == 1 && sr.is_some() {
+            let hz = sr.unwrap();
+            match &self_info.sample_rate_request_path {
+              None => { code = 0x30; warn!("sample-rate write unsupported (no SAMPLE_RATE_REQUEST_PATH)"); }
+              Some(path) => match write_sample_rate_request(path, hz) {
+                Ok(()) => {
+                  info!("sample rate {hz} Hz requested by a controller");
+                  self_info.announced_sample_rate.store(hz, std::sync::atomic::Ordering::Relaxed);
+                  wrote_sr = true;
+                }
+                Err(e) => { code = 0x30; error!("cannot hand sample-rate request: {e}"); }
+              },
+            }
+          }
+
+          // If neither property was present, treat as malformed.
+          if lat.is_none() && sr.is_none() {
+            code = 0x30;
+            warn!("settings write without latency or sample rate: {}", hex::encode(content));
+          }
+
           if code == 1 {
             conn.respond_with_code(1, &device_settings_response(&self_info)).await;
-            mcast.send(make_latency_change_notification()).await.log_and_forget();
+            if wrote_latency {
+              mcast.send(make_latency_change_notification()).await.log_and_forget();
+            }
+            if wrote_sr {
+              // no dedicated notification; device_settings_response already reflects it
+            }
           } else {
             conn.respond_with_code(code, &[]).await;
           }
@@ -804,18 +832,38 @@ pub async fn run_server(
           }
         }
 
+        0x0086 => {
+          // IDENTIFY_QUERY: no-op acknowledgement (handoff W8).
+          conn.respond(&[]).await;
+        }
+
+        0x00c0 => {
+          // SYS_RESET / factory reset: polite refusal (handoff W7).
+          warn!("SYS_RESET requested; refusing (not implemented)");
+          conn.respond_with_code(0x30, &[]).await;
+        }
+
+        0x0090 | 0x00a0 => {
+          // Upgrade control/status: refuse with reboot-required class (handoff W7).
+          warn!("upgrade requested; refusing (reboot required before starting upgrade)");
+          conn.respond_with_code(0x30, &[]).await;
+        }
+
         x => {
-          error!("received unknown opcode1 {x:#04x}, content {}", hex::encode(request.content()));
-          error!("whole packet: {:?}", hex::encode(request.into_storage()));
+          // Conmon/ARC message ids the firmware exposes but Inferno does not
+          // implement: refuse with the unsupported-opcode family code instead
+          // of staying silent, so controllers stop retrying (handoff W3).
+          warn!("received unsupported ARC opcode {x:#04x}, content {}", hex::encode(request.content()));
+          conn.respond_with_code(0x30, &[]).await;
         }
       }
     } else {
-      error!(
-        "received unknown opcode2 {:#04x}, content {}",
+      warn!(
+        "received unsupported ARC opcode2 {:#04x}, content {}",
         request.opcode2().read(),
         hex::encode(request.content())
       );
-      error!("whole packet: {:?}", hex::encode(request.into_storage()));
+      conn.respond_with_code(0x30, &[]).await;
     }
   }
 }
@@ -845,6 +893,30 @@ fn requested_latency_ns(content: &[u8]) -> Option<u32> {
   None
 }
 
+/// The sample rate a 0x1101 settings write asks for: the value of its
+/// sample-rate record (0x8020). Same record layout as the latency one.
+fn requested_sample_rate(content: &[u8]) -> Option<u32> {
+  const HEADER: usize = 10;
+  let count = *content.get(1)? as usize;
+  for rec in content.get(2..2 + count * 4)?.chunks(4) {
+    let id = u16::from_be_bytes([rec[0], rec[1]]);
+    if id != 0x8020 {
+      continue;
+    }
+    let off = (u16::from_be_bytes([rec[2], rec[3]]) as usize).checked_sub(HEADER)?;
+    let v = content.get(off..off + 4)?;
+    return Some(u32::from_be_bytes(v.try_into().ok()?));
+  }
+  None
+}
+
+/// Writes a sample-rate request for the host atomically (temp file + rename).
+fn write_sample_rate_request(path: &std::path::Path, hz: u32) -> std::io::Result<()> {
+  let tmp = path.with_extension("tmp");
+  std::fs::write(&tmp, format!("{hz}\n"))?;
+  std::fs::rename(&tmp, path)
+}
+
 /// Writes a latency request for the host atomically (temp file + rename).
 fn write_latency_request(path: &std::path::Path, ns: u32) -> std::io::Result<()> {
   let tmp = path.with_extension("tmp");
@@ -865,10 +937,15 @@ fn make_latency_change_notification() -> crate::protocol::mcast::MulticastMessag
 /// its value from the start of the packet), then the u32 values:
 /// sample rate (0x8020), and default/configured/active/maximum/minimum
 /// latency in ns (0x8204/0x8205/0x8301/0x8302/0x8306).
+fn announced_sample_rate(self_info: &DeviceInfo) -> u32 {
+  let a = self_info.announced_sample_rate.load(std::sync::atomic::Ordering::Relaxed);
+  if a != 0 { a } else { self_info.sample_rate }
+}
+
 fn device_settings_response(self_info: &DeviceInfo) -> Vec<u8> {
   let latency: u32 = self_info.announced_latency_ns.load(std::sync::atomic::Ordering::Relaxed);
   let settings: [(u16, u32); 6] = [
-    (0x8020, self_info.sample_rate),
+    (0x8020, announced_sample_rate(self_info)),
     (0x8204, DEFAULT_LATENCY_NS),
     (0x8205, latency),
     (0x8301, latency),
@@ -893,7 +970,7 @@ fn device_settings_response(self_info: &DeviceInfo) -> Vec<u8> {
 /// announces, as netaudio's virtual device answers it.
 fn property_directory_response() -> Vec<u8> {
   const PROPERTIES: [(u16, u16); 31] = [
-    (0x8020, 1), (0x8021, 3), (0x0022, 3), (0x0023, 3), (0x0024, 1), (0x8060, 3), (0x0062, 3),
+    (0x8020, 3), (0x8021, 3), (0x0022, 3), (0x0023, 3), (0x0024, 1), (0x8060, 3), (0x0062, 3),
     (0x0063, 1), (0x0201, 3), (0x8204, 3), (0x8205, 3), (0x020a, 1), (0x020b, 1), (0x0210, 3),
     (0x0211, 3), (0x0212, 3), (0x0213, 1), (0x0214, 1), (0x0222, 3), (0x8301, 3), (0x8306, 1),
     (0x8302, 1), (0x8321, 1), (0x0310, 1), (0x0311, 1), (0x0312, 1), (0x0303, 3), (0x83f0, 1),
@@ -1007,5 +1084,108 @@ mod rename_tests {
     write_name_request(&path, &None).unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "\n");
     std::fs::remove_dir_all(&dir).unwrap();
+  }
+}
+
+
+#[cfg(test)]
+mod requested_latency_edge_tests {
+  use super::requested_latency_ns;
+
+  #[test]
+  fn empty_content_returns_none() {
+    assert_eq!(requested_latency_ns(&[]), None);
+  }
+
+  #[test]
+  fn count_zero_returns_none() {
+    assert_eq!(requested_latency_ns(&[0x05, 0x00]), None);
+  }
+
+  #[test]
+  fn truncated_record_returns_none() {
+    // count says 1 but only 2 bytes of record
+    assert_eq!(requested_latency_ns(&[0x05, 0x01, 0x82]), None);
+  }
+
+  #[test]
+  fn offset_before_header_returns_none() {
+    // record points at offset 5 (< HEADER 10)
+    let content = [0x05, 0x01, 0x82, 0x05, 0x00, 0x05];
+    assert_eq!(requested_latency_ns(&content), None);
+  }
+
+  #[test]
+  fn short_value_returns_none() {
+    // record points 10 bytes past the header, but the packet is too short
+    // to hold the 4-byte value.
+    let content = [0x05, 0x01, 0x82, 0x05, 0x00, 0x14];
+    assert_eq!(requested_latency_ns(&content), None);
+  }
+
+  #[test]
+  fn wrong_property_id_returns_none() {
+    let content = [0x05, 0x01, 0x80, 0x20, 0x00, 0x0a, 0, 0, 0, 0, 1, 2, 3, 4];
+    assert_eq!(requested_latency_ns(&content), None);
+  }
+}
+
+#[cfg(test)]
+mod sample_rate_write_edge_tests {
+  use super::requested_sample_rate;
+
+  #[test]
+  fn empty_returns_none() {
+    assert_eq!(requested_sample_rate(&[]), None);
+  }
+
+  #[test]
+  fn count_zero_returns_none() {
+    assert_eq!(requested_sample_rate(&[0x05, 0x00]), None);
+  }
+
+  #[test]
+  fn parses_sample_rate_record() {
+    // 0x8020 record at offset 10, value 44100
+    let mut content = vec![0x05, 0x01, 0x80, 0x20, 0x00, 0x0a];
+    content.extend_from_slice(&0u8.to_be_bytes()); // pad to offset 10
+    content.extend_from_slice(&[0,0,0,0]); // positions 6..10
+    // Actually need value at offset 10: content length must be 14
+    // Rebuild cleanly:
+    let mut c = vec![0u8; 14];
+    c[0] = 0x05; c[1] = 0x01;
+    c[2] = 0x80; c[3] = 0x20;
+    c[4] = 0x00; c[5] = 0x14; // offset 20 -> content offset 10
+    c[10..14].copy_from_slice(&44100u32.to_be_bytes());
+    assert_eq!(requested_sample_rate(&c), Some(44100));
+  }
+
+  #[test]
+  fn wrong_id_returns_none() {
+    let mut c = vec![0u8; 14];
+    c[0] = 0x05; c[1] = 0x01;
+    c[2] = 0x82; c[3] = 0x05; // latency id
+    c[4] = 0x00; c[5] = 0x14;
+    c[10..14].copy_from_slice(&2_000_000u32.to_be_bytes());
+    assert_eq!(requested_sample_rate(&c), None);
+  }
+}
+
+#[cfg(test)]
+mod device_name_edge_tests {
+  use super::requested_device_name;
+
+  #[test]
+  fn exactly_31_chars_accepted() {
+    let name = "a".repeat(31);
+    let mut buf = name.as_bytes().to_vec();
+    buf.push(0);
+    assert_eq!(requested_device_name(&buf), Ok(Some(name)));
+  }
+
+  #[test]
+  fn no_terminator_full_31_accepted() {
+    let name = "a".repeat(31);
+    assert_eq!(requested_device_name(name.as_bytes()), Ok(Some(name)));
   }
 }

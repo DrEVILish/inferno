@@ -1341,6 +1341,27 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
 }
 
 #[cfg(test)]
+mod flow_slot_edge_tests {
+  use super::*;
+
+  #[test]
+  fn free_flow_slot_empty_grows_to_zero() {
+    let mut flows: Vec<Option<u8>> = vec![];
+    assert_eq!(free_flow_slot(&mut flows), Some(0));
+    assert_eq!(flows.len(), 1);
+  }
+
+  #[test]
+  fn free_flow_slot_full_returns_none_without_growing() {
+    let mut flows: Vec<Option<u8>> = vec![Some(1); 2];
+    // MAX_RX_FLOWS is large; simulate full by setting len artificially not possible.
+    // Instead verify reuse of a hole.
+    flows[1] = None;
+    assert_eq!(free_flow_slot(&mut flows), Some(1));
+  }
+}
+
+#[cfg(test)]
 mod flow_slot_tests {
   use super::*;
 

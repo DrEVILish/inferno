@@ -25,7 +25,9 @@ impl StateStorage {
     let dir = match &self_info.state_dir {
       Some(dir) => dir.to_string_lossy().into_owned(),
       None => {
-        AppDirs::new(Some("inferno_aoip"), false).unwrap().state_dir.to_str().unwrap().to_owned()
+        AppDirs::new(Some("inferno_aoip"), false)
+          .map(|d| d.state_dir.to_string_lossy().into_owned())
+          .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().into_owned())
           + MAIN_SEPARATOR_STR
           + &hex::encode(self_info.factory_device_id)
       }
@@ -130,6 +132,43 @@ mod tests {
     let path = format!("{}bad{PATH_SUFFIX}", storage.path_prefix);
     std::fs::write(&path, "not valid toml [[[").unwrap();
     let result: Result<TestConfig, Box<dyn Error>> = storage.load("bad");
+    assert!(result.is_err());
+  }
+}
+
+
+#[cfg(test)]
+mod robustness_tests {
+  use super::*;
+  use serde::{Deserialize, Serialize};
+  use std::time::{SystemTime, UNIX_EPOCH};
+
+  #[derive(Serialize, Deserialize, Debug, PartialEq)]
+  struct TestConfig { name: String, count: u32 }
+
+  fn temp() -> StateStorage {
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!("inferno_aoip_rb_{ts}")).to_str().unwrap().to_owned();
+    std::fs::create_dir_all(&dir).unwrap();
+    StateStorage { path_prefix: dir + std::path::MAIN_SEPARATOR_STR }
+  }
+
+  #[test]
+  fn load_empty_file_fails() {
+    let storage = temp();
+    let path = format!("{}empty{PATH_SUFFIX}", storage.path_prefix);
+    std::fs::write(&path, "").unwrap();
+    let result: Result<TestConfig, Box<dyn Error>> = storage.load("empty");
+    assert!(result.is_err());
+  }
+
+  #[test]
+  fn load_whitespace_only_fails() {
+    let storage = temp();
+    let path = format!("{}ws{PATH_SUFFIX}", storage.path_prefix);
+    std::fs::write(&path, "   
+").unwrap();
+    let result: Result<TestConfig, Box<dyn Error>> = storage.load("ws");
     assert!(result.is_err());
   }
 }

@@ -71,6 +71,7 @@ pub(crate) mod channels_subscriber;
 pub(crate) mod flows_rx;
 pub(crate) mod flows_tx;
 mod peaks;
+pub(crate) mod metering;
 pub(crate) mod samples_collector;
 pub(crate) mod samples_utils;
 pub(crate) mod saved_settings;

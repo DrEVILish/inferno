@@ -142,17 +142,17 @@ pub async fn run_server(
         }
 
         x => {
-          error!("received unknown opcode1 {x:#04x}, content {}", hex::encode(request.content()));
-          error!("whole packet: {:?}", hex::encode(request.into_storage()));
+          warn!("received unsupported flows-control opcode {x:#04x}, content {}", hex::encode(request.content()));
+          conn.respond_with_code(0x30, &[]).await;
         }
       }
     } else {
-      error!(
-        "received unknown opcode2 {:#04x}, content {}",
+      warn!(
+        "received unsupported flows-control opcode2 {:#04x}, content {}",
         request.opcode2().read(),
         hex::encode(request.content())
       );
-      error!("whole packet: {:?}", hex::encode(request.into_storage()));
+      conn.respond_with_code(0x30, &[]).await;
     }
   }
   if let Some(tx) = flows_tx.lock().await.as_mut() {

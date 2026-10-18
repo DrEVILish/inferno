@@ -23,10 +23,44 @@ use tokio::{
 
 const SEND_BUFFER_SIZE: usize = 1500;
 
-/// Board info capability word: manufacturer name, sample rate and encoding
-/// configuration (see send_board_info). The rate and encoding lists hold
-/// only the running values, so a controller can show but not change them.
-const BOARD_PRIMARY_CAPABILITIES: u32 = 0x0000_1000 | 0x0000_0008 | 0x0000_0010;
+/// Feature flags feeding the capability word. Keep this honest: only set a bit
+/// when the corresponding behaviour is actually implemented (handoff W4/W8).
+#[derive(Clone, Copy, Default)]
+pub struct CapabilityFeatures {
+  pub manufacturer_name: bool,
+  pub sample_rate_config: bool,
+  pub encoding_config: bool,
+  pub static_ipv4: bool,
+  pub identify: bool,
+  pub locking: bool,
+  pub aes67: bool,
+  pub metering: bool,
+  pub serial_ports: bool,
+  pub leds: bool,
+}
+
+/// Compute the primary capability word from a feature table (handoff W4).
+/// Bit positions per netaudio's parser (see send_board_info comments).
+pub fn primary_capabilities(f: &CapabilityFeatures) -> u32 {
+  let mut w = 0u32;
+  if f.manufacturer_name { w |= 0x0000_1000; }
+  if f.sample_rate_config { w |= 0x0000_0008; }
+  if f.encoding_config { w |= 0x0000_0010; }
+  if f.static_ipv4 { w |= 0x0000_4000; }
+  if f.identify { w |= 0x0000_0001; }
+  if f.locking { w |= 0x0800_0000; }
+  if f.aes67 { w |= 0x0400_0000; }
+  // metering/serial/leds live in other capability words; keep primary honest.
+  let _ = (f.metering, f.serial_ports, f.leds);
+  w
+}
+
+/// Default feature set for Inferno today: sample-rate/encoding are reported
+/// (running values only) and manufacturer name is present. Write paths are
+/// not implemented, so config bits are left on only to keep DC showing values
+/// (matches prior behaviour).
+const BOARD_PRIMARY_CAPABILITIES: u32 =
+  0x0000_1000 | 0x0000_0008 | 0x0000_0010;
 const DST_PORT_HEARTBEAT: u16 = 8708;
 const DST_PORT_DEVICE_INFO: u16 = 8702;
 
@@ -170,7 +204,8 @@ impl<'s> Multicaster<'s> {
     // Without the sample rate / encoding bits a controller's device config
     // leaves both blank ("does not support sample rate configuration") even
     // though the 0x81/0x83 probes are answered.
-    content[0x14..0x18].copy_from_slice(&BOARD_PRIMARY_CAPABILITIES.to_be_bytes());
+    let feats = CapabilityFeatures { manufacturer_name: true, sample_rate_config: true, encoding_config: true, ..Default::default() };
+    content[0x14..0x18].copy_from_slice(&primary_capabilities(&feats).to_be_bytes());
 
     content[0xbb] = 0x1f; // if 0, device is flooded with info multicast requests around 1 per second
                           /* content[0xbf] = 5;
@@ -210,7 +245,11 @@ impl<'s> Multicaster<'s> {
       .get_overlay()
       .as_ref()
       .map(|clkovl| {
-        let freq_offset_f = (clkovl.freq_scale_including_hw() * 1_000_000_000f64).round();
+        #[cfg(target_os = "linux")]
+        let scale = clkovl.freq_scale_including_hw();
+        #[cfg(not(target_os = "linux"))]
+        let scale = clkovl.freq_scale;
+        let freq_offset_f = (scale * 1_000_000_000f64).round();
         if i32::MIN as f64 <= freq_offset_f && freq_offset_f <= i32::MAX as f64 {
           Some(freq_offset_f as i32)
         } else {
@@ -657,5 +696,41 @@ mod capability_tests {
     assert_eq!(&c[8..12], &24u32.to_be_bytes());
     assert_eq!(&c[12..14], &[0, 1]);
     assert_eq!(&c[16..], &[0, 0, 0, 16, 0, 0, 0, 24, 0, 0, 0, 32]);
+  }
+}
+
+#[cfg(test)]
+mod capability_word_tests {
+  use super::{primary_capabilities, CapabilityFeatures};
+
+  #[test]
+  fn default_features_match_legacy_word() {
+    let f = CapabilityFeatures { manufacturer_name: true, sample_rate_config: true, encoding_config: true, ..Default::default() };
+    assert_eq!(primary_capabilities(&f), 0x0000_1000 | 0x0000_0008 | 0x0000_0010);
+  }
+
+  #[test]
+  fn serial_leds_metering_do_not_set_primary_bits() {
+    let f = CapabilityFeatures { serial_ports: true, leds: true, metering: true, ..Default::default() };
+    assert_eq!(primary_capabilities(&f), 0);
+  }
+
+  #[test]
+  fn no_features_yields_zero() {
+    assert_eq!(primary_capabilities(&CapabilityFeatures::default()), 0);
+  }
+
+  #[test]
+  fn identify_bit() {
+    let f = CapabilityFeatures { identify: true, ..Default::default() };
+    assert_eq!(primary_capabilities(&f) & 0x0000_0001, 0x0000_0001);
+  }
+
+  #[test]
+  fn aes67_and_lock_bits() {
+    let f = CapabilityFeatures { aes67: true, locking: true, ..Default::default() };
+    let w = primary_capabilities(&f);
+    assert_eq!(w & 0x0400_0000, 0x0400_0000);
+    assert_eq!(w & 0x0800_0000, 0x0800_0000);
   }
 }
