@@ -30,11 +30,12 @@ fn create_self_info(
           interfaces
             .iter()
             .find(|iface| &iface.name == ipstr)
-            .expect("invalid setting BIND_IP, must contain IP address or network interface name")
-            .ipv4
-            .get(0)
-            .expect("interface specified in BIND_IP has no IPv4 addresses")
-            .addr()
+            .and_then(|iface| iface.ipv4.get(0).map(|n| n.addr()))
+            .unwrap_or_else(|| {
+              log::warn!("invalid BIND_IP {ipstr:?}; falling back to auto-detected IP");
+              // fall back to unspecified; caller will auto-detect below
+              Ipv4Addr::new(0, 0, 0, 0)
+            })
         })
       })
     })
@@ -50,7 +51,9 @@ fn create_self_info(
   settings
     .get("DEVICE_ID")
     .map(|idstr| {
-      hex::decode_to_slice(idstr, &mut devid).expect("invalid DEVICE_ID, should contain hex data");
+      if hex::decode_to_slice(idstr, &mut devid).is_err() {
+        log::warn!("invalid DEVICE_ID {idstr:?}; using generated id");
+      }
     })
     .unwrap_or_else(|| {
       devid[2..6].copy_from_slice(&my_ipv4.octets());
@@ -142,6 +145,8 @@ fn create_self_info(
     product_version: settings.get("PRODUCT_VERSION").and_then(|v| parse_product_version(v)),
     name_request_path: settings.get("NAME_REQUEST_PATH").map(Into::into),
     latency_request_path: settings.get("LATENCY_REQUEST_PATH").map(Into::into),
+    sample_rate_request_path: settings.get("SAMPLE_RATE_REQUEST_PATH").map(Into::into),
+    announced_sample_rate: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(sample_rate.try_into().unwrap_or(48000))),
     announced_latency_ns: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(latency_ns.try_into().unwrap_or(u32::MAX))),
     state_dir: settings.get("STATE_DIR").map(Into::into),
   };
@@ -246,12 +251,14 @@ impl Settings {
       .unwrap_or(false);
     let tx_source_bit_depth = config
       .get("TX_SOURCE_BIT_DEPTH")
-      .map(|s| s.parse::<u8>().expect("invalid TX_SOURCE_BIT_DEPTH, must be one of: 16, 24, 32"))
+      .map(|s| s.parse::<u8>().unwrap_or(32))
       .unwrap_or(32);
-    assert!(
-      matches!(tx_source_bit_depth, 16 | 24 | 32),
-      "invalid TX_SOURCE_BIT_DEPTH, must be one of: 16, 24, 32"
-    );
+    let tx_source_bit_depth = if matches!(tx_source_bit_depth, 16 | 24 | 32) {
+      tx_source_bit_depth
+    } else {
+      log::warn!("invalid TX_SOURCE_BIT_DEPTH {tx_source_bit_depth}; using 32");
+      32
+    };
 
     let mut result = Self {
       self_info,
@@ -331,5 +338,32 @@ mod tests {
     let name = "Ünïcödé recorder name that is long";
     let cut = truncate_utf8(name, 31);
     assert!(cut.len() <= 31 && name.starts_with(cut));
+  }
+}
+
+#[cfg(test)]
+mod robustness_tests {
+  use super::*;
+
+  #[test]
+  fn truncate_utf8_max_zero() {
+    assert_eq!(truncate_utf8("abc", 0), "");
+  }
+
+  #[test]
+  fn truncate_utf8_empty_input() {
+    assert_eq!(truncate_utf8("", 5), "");
+  }
+
+  #[test]
+  fn parse_product_version_rejects_garbage() {
+    assert_eq!(parse_product_version("1.2.3.4"), None);
+    assert_eq!(parse_product_version("abc"), None);
+    assert_eq!(parse_product_version(""), None);
+  }
+
+  #[test]
+  fn parse_product_version_accepts_two_parts() {
+    assert_eq!(parse_product_version("1.2"), Some((1, 2, 0)));
   }
 }

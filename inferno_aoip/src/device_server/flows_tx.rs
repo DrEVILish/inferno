@@ -277,9 +277,9 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
     let mut notify =
       self.on_transfer.as_ref().map(|t| NotifyThrottle::new(t.max_interval_samples, sample_rate as u32));
     let mut next_process_events = now as Clock;
-    drop(now);
+    let _ = now;
 
-    set_current_thread_realtime(81);
+    let _ = set_current_thread_realtime(81);
     loop {
       let min_next_ts = self
         .flows
@@ -958,6 +958,25 @@ mod layout_tests {
   }
 
   #[test]
+  fn empty_channel_list_is_ok() {
+    assert_eq!(validate_flow_layout(&[], 2, 3, 1), Ok(()));
+  }
+
+  #[test]
+  fn bytes_per_sample_out_of_range() {
+    assert!(validate_flow_layout(&[Some(0)], 16, 1, 1).is_err());
+    assert!(validate_flow_layout(&[Some(0)], 16, 5, 1).is_err());
+  }
+
+  #[test]
+  fn channel_index_equal_to_count_rejected() {
+    assert_eq!(
+      validate_flow_layout(&[Some(2)], 16, 3, 2),
+      Err(FlowLayoutError::ChannelIndex { index: 2, channels: 2 })
+    );
+  }
+
+  #[test]
   fn packet_size_limit_is_exact() {
     // 9 + n * 4 * 2 <= MTU  =>  n = 186 fits, 187 does not
     assert_eq!(validate_flow_layout(&vec![None; 186], 2, 4, 1), Ok(()));
@@ -999,6 +1018,8 @@ mod restart_tests {
       product_version: None,
       name_request_path: None,
       latency_request_path: None,
+      sample_rate_request_path: None,
+      announced_sample_rate: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
       announced_latency_ns: Default::default(),
       state_dir: None,
     }

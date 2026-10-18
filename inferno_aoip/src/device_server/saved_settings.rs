@@ -126,3 +126,28 @@ mod tests {
     }
   }
 }
+
+#[cfg(test)]
+mod robustness_tests {
+  use super::*;
+
+  #[test]
+  fn valid_name_boundary_31_bytes() {
+    assert!(is_valid_channel_name(&"a".repeat(31)));
+    assert!(!is_valid_channel_name(&"a".repeat(32)));
+  }
+
+  #[test]
+  fn valid_name_rejects_control_and_separators() {
+    for bad in [".", "=", "@", "\u{0000}", "\u{001f}", "a\nb", "a\tb"] {
+      assert!(!is_valid_channel_name(bad), "{bad:?}");
+    }
+  }
+
+  #[test]
+  fn valid_name_accepts_max_utf8_multibyte_if_within_byte_limit() {
+    // 31 bytes of a 2-byte char is impossible (odd), but 30 bytes (15 chars) fits
+    assert!(is_valid_channel_name(&"Ä".repeat(15)));
+    assert!(!is_valid_channel_name(&"Ä".repeat(16))); // 32 bytes
+  }
+}

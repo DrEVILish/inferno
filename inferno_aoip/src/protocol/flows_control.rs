@@ -376,6 +376,8 @@ mod tests {
       product_version: None,
       name_request_path: None,
       latency_request_path: None,
+      sample_rate_request_path: None,
+      announced_sample_rate: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
       announced_latency_ns: Default::default(),
       state_dir: None,
     }
