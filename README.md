@@ -292,6 +292,7 @@ If you want to contribute but can't code or don't know where to start because th
 # Changelog
 
 ## Unreleased
+* [Upstream gap review and incremental PR index](docs/upstream-gap-review.md): all 43 fork-only commits accounted for, with submitted fixes, test evidence, remaining gaps and unverified protocol work.
 * `MAX_RX_LATENCY_NS`: refuse subscriptions to transmitters demanding more latency than that, reporting the "channel latency" status (0x1A, unverified against Dante Controller)
 * advertise `TX_LATENCY_NS` (not `RX_LATENCY_NS`) as the latency of transmit channels and multicast flows in mDNS
 
