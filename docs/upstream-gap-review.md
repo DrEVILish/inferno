@@ -41,6 +41,14 @@ The initial parallel library run hit the existing PTP kernel receive-timestamp t
 
 Review used separate protocol and safety comparisons, followed by reviews of the ported diffs. One state-directory concern prompted a regression test. Upstream already treats empty configuration values as unset; the port preserves that behavior and also ignores a directly supplied empty PathBuf. No user state directories or production network interfaces were changed by these tests.
 
+## Initial upstream CI results
+
+The first submitted PR has additional CI failures, so this series is not reported as fully green:
+
+- [Linux job](https://github.com/network-audio/inferno/actions/runs/43736025321/job/132878700540): all 23 ALSA DAW tests fail at the plugin-path assertion. The test executable runs under `target/debug/build/alsa_pcm_inferno/.../out/`, while `plugin_path()` assumes `target/debug/deps/` and looks for the shared library in the wrong directory. The affected test helper is unchanged by the ARC decoder patch. A standalone test-harness fix is appropriate; no such fix is included here.
+- [Windows shared-IP 44.1 kHz job](https://github.com/network-audio/inferno/actions/runs/43736025334/job/132878701325): the microphone path received matching audio, but the speaker recording reports wrong audio after about 1.6 seconds of matching frames. Other end-to-end variants passed. The cause is not established, and this review does not label it a pre-existing flake or claim hardware compatibility.
+- At submission, most other jobs were queued or still running. Local serial library results remain separate from CI results.
+
 ## Confirmed gaps needing later increments
 
 These are absent upstream and are not implemented by the submitted batch. They are listed separately so the series does not claim full convergence.
